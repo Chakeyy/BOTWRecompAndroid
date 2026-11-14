@@ -1481,17 +1481,74 @@ static VkSpan gmap_copy(void) {
 }
 #endif
 
+#ifdef __ANDROID__
+static bool g_last_fast_ok;
+static uint32_t g_last_fast_bucket;
+#endif
+
+static inline void bind_state_slots(void *slot_base, size_t elem_size, uint64_t limit,
+                                    uint64_t stage, uint64_t first, uint64_t count,
+                                    const void *src, uint64_t *stage_ver) {
+    if (stage >= 6 || first >= limit || count == 0 || !src) return;
+    uint64_t avail = limit - first;
+    uint64_t n = count < avail ? count : avail;
+    size_t bytes = (size_t)n * elem_size;
+    uint8_t *dst = (uint8_t *)slot_base + (stage * limit + first) * elem_size;
+    if (memcmp(dst, src, bytes) != 0) {
+        memcpy(dst, src, bytes);
+        stage_ver[stage]++;
+    }
+}
+
+static inline uint64_t dedupe_hash64(const void *data, uint64_t size) {
+    uint64_t h = 1469598103934665603ull ^ size;
+    const uint8_t *p = (const uint8_t *)data;
+    uint64_t i = 0;
+    for (; i + 8 <= size; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        h = (h ^ w) * 1099511628211ull;
+    }
+    for (; i < size; i++) h = (h ^ p[i]) * 1099511628211ull;
+    return h;
+}
+
 static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t align) {
-    static struct { uint64_t epoch, size; uint8_t data[0x800]; VkSpan span; } last[DEDUPE_SLOTS];
-    if (size > sizeof last[0].data) return vk_transient_copy(data, size, align);
-    if (active >= 0 && last[slot].epoch == chunk_epoch && last[slot].span.buf == chunks[active].buf &&
-        last[slot].size == size && !memcmp(last[slot].data, data, size)) {
-        chunks[active].seq = vk_pending_seq();
-        chunks[active].frame = renderer_present_count();
-        return last[slot].span;
+    enum { DEDUPE_WAYS = 4 };
+    static struct {
+        uint64_t epoch, size, hash;
+        VkBuffer buf;
+        VkSpan span;
+        uint8_t data[0x800];
+    } ways[DEDUPE_SLOTS][DEDUPE_WAYS];
+    static uint8_t rr[DEDUPE_SLOTS], mru[DEDUPE_SLOTS];
+    if (size > sizeof ways[0][0].data) return vk_transient_copy(data, size, align);
+    uint64_t h = dedupe_hash64(data, size);
+    if (active >= 0) {
+        VkBuffer abuf = chunks[active].buf;
+        uint8_t first = mru[slot] & 3u;
+        for (int k = 0; k < DEDUPE_WAYS; k++) {
+            int w = (first + k) & 3;
+            if (ways[slot][w].epoch == chunk_epoch && ways[slot][w].buf == abuf &&
+                ways[slot][w].hash == h && ways[slot][w].size == size &&
+                !memcmp(ways[slot][w].data, data, size)) {
+                chunks[active].seq = vk_pending_seq();
+                chunks[active].frame = renderer_present_count();
+                mru[slot] = (uint8_t)w;
+                return ways[slot][w].span;
+            }
+        }
     }
     VkSpan s = vk_transient_copy(data, size, align);
-    last[slot].epoch = chunk_epoch; last[slot].size = size; memcpy(last[slot].data, data, size); last[slot].span = s;
+    int w = rr[slot] & 3;
+    rr[slot] = (uint8_t)((w + 1) & 3);
+    mru[slot] = (uint8_t)w;
+    ways[slot][w].epoch = chunk_epoch;
+    ways[slot][w].size = size;
+    ways[slot][w].hash = h;
+    ways[slot][w].buf = active >= 0 ? chunks[active].buf : s.buf;
+    ways[slot][w].span = s;
+    memcpy(ways[slot][w].data, data, size);
     return s;
 }
 
@@ -2526,12 +2583,11 @@ static void begin_pass(void) {
         extern bool vk_async_on(void);
         static long chunk = -1;
         if (chunk < 0) {
-            // (not on Qualcomm's driver or Mali in copy mode: the render thread is slow in copy mode, and mid-frame
-            // submissions re-run vc_flush / plat_written_pages mprotect scans 4-5x per frame while leaving GPU idle gaps)
+            // Restore pass-boundary chunking on Mali (6 ms) so CPU recording and GPU execution overlap instead of
+            // serializing the entire frame before present, while split_long_pass stays 0 to preserve TBDR tile passes.
             extern bool vk_driver_is_qualcomm(void);
             const char *e = getenv("LARECOMP_VK_CHUNK_US");
-            chunk = e ? atol(e) : (vk_driver_is_qualcomm() || (g_vk.props.vendorID == 0x13B5 && gcopy_mode)) ? 0
-                                : g_vk.props.vendorID == 0x13B5 ? 4000 : 2000;
+            chunk = e ? atol(e) : vk_driver_is_qualcomm() ? 0 : g_vk.props.vendorID == 0x13B5 ? 6000 : 2000;
         }
         extern int vk_ab(const char *what);
         long ch = chunk > 0 && AB("chunk") == 1 ? 500 : chunk;
@@ -6788,17 +6844,24 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     if (fast_off < 0) fast_off = getenv("LARECOMP_NO_STAGE_FAST") != NULL;
     if (set_cache_off < 0) set_cache_off = getenv("LARECOMP_NO_SET_CACHE") != NULL;
     bool bindless = stage == 0 ? p->vi_bindless : stage == 1 ? p->fi_bindless : true;
-    NvnTexture *rt0 = st.rt.ncolor ? st.rt.color[0] : NULL;
-    bool ui_pass_vs = stage == 0 && rt0 && vk_texture_scale_group(rt0) == RS_OUT;
     uint64_t pending = vk_pending_seq();
     uint64_t cur_frame = vk_frame_counter();
     float rs0_cur[4] = {1, 1, 0, 0}, tint_cur[8] = {0};
-    if (rscale_row0) memcpy(rs0_cur, rscale_row0, 16);
-    if (tint) memcpy(tint_cur, tint, 32);
+    if (stage == 1) {
+        if (rscale_row0) memcpy(rs0_cur, rscale_row0, 16);
+        if (tint) memcpy(tint_cur, tint, 32);
+    }
     bool can_fast = !fast_off && !set_cache_off && stage < 2 && !bindless && !si->uses_gmem_map &&
-                    !up_fix.sx && !ui_pass_vs && !naliases && !nfeedback && !n_pass_fb && !scene_up.t &&
+                    !up_fix.sx && !naliases &&
+                    ((stage == 0 && si->ntex == 0) || (!nfeedback && !n_pass_fb && !scene_up.t)) &&
                     (stage == 0 || (pre_ii && fii_memo_active_id));
+    if (can_fast && stage == 0) {
+        NvnTexture *rt0 = st.rt.ncolor ? st.rt.color[0] : NULL;
+        if (rt0 && vk_texture_scale_group(rt0) == RS_OUT) can_fast = false;
+    }
     uint32_t fbucket = can_fast ? fast_bucket_idx(si, layout, stage) : 0;
+    g_last_fast_ok = can_fast;
+    g_last_fast_bucket = fbucket;
     if (can_fast) {
         StageSetFast *way = fast_tab[stage][fbucket];
         for (int i = 0; i < 2; i++) {
@@ -7277,6 +7340,157 @@ static bool topology(uint32_t mode, VkPrimitiveTopology *t, uint8_t *cls) {
     case 5: *t = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; *cls = 2; return true;
     default: *t = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; *cls = 2; return false;
     }
+}
+
+#ifdef __ANDROID__
+typedef struct {
+    ShaderInfo *si;
+    VkDescriptorSetLayout layout;
+    VkDescriptorSet ds;
+    VkBuffer gmem_buf;
+    uint64_t exec_seq, epoch, gcopy_gen, frame, ubo_data_ver, pool_ver, sbuf_ver, img_ver, tex_ver, fii_stamp;
+    uint32_t rgen, vgen, sgen, bank_epoch, mir_w, cbuf_mask;
+    uint8_t set, ndyn, ncb;
+    int8_t bank;
+    uint32_t dyn[16];
+    float rs0[4], tint[8];
+    Range cb[8];
+} StageFast2;
+static StageFast2 fast2_tab[2][512][4];
+
+static inline uint32_t fast2_bucket(const ShaderInfo *si, VkDescriptorSetLayout layout, int stage,
+                                    const Range *cb, int ncb, uint64_t extra) {
+    uint64_t h = (uintptr_t)si * 0x9E3779B97F4A7C15ull ^ (uintptr_t)layout * 0xBF58476D1CE4E5B9ull ^
+                 ((uint64_t)stage << 40) ^ extra * 0x94D049BB133111EBull;
+    for (int i = 0; i < ncb; i++) {
+        h ^= cb[i].addr * 0x9E3779B97F4A7C15ull ^ (cb[i].size * 0x517CC1B727220A95ull);
+        h = (h ^ (h >> 29)) * 0x94D049BB133111EBull;
+    }
+    return (uint32_t)(h ^ (h >> 18) ^ (h >> 36)) & 511u;
+}
+#endif
+
+static VkDescriptorSet stage_set_cached(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si,
+                                        const float *rscale_row0, const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz,
+                                        const VkDescriptorImageInfo *pre_ii, uint32_t *dyn, uint32_t *ndyn) {
+#ifdef __ANDROID__
+    static int fast2_off = -1, set2_off = -1;
+    if (fast2_off < 0) fast2_off = getenv("LARECOMP_NO_STAGE_FAST") != NULL;
+    if (set2_off < 0) set2_off = getenv("LARECOMP_NO_SET_CACHE") != NULL;
+    bool bindless = stage == 0 ? p->vi_bindless : stage == 1 ? p->fi_bindless : true;
+    bool eligible = !fast2_off && !set2_off && stage < 2 && si && !bindless && !si->uses_gmem_map && !si->cbwin_mask &&
+                    !up_fix.sx && !g_wide_backdrop && !naliases &&
+                    ((stage == 0 && si->ntex == 0) || (!nfeedback && !n_pass_fb && !scene_up.t)) &&
+                    (stage == 0 || (pre_ii && fii_memo_active_id));
+    if (eligible && stage == 0) {
+        NvnTexture *rt0 = st.rt.ncolor ? st.rt.color[0] : NULL;
+        if (rt0 && vk_texture_scale_group(rt0) == RS_OUT) eligible = false;
+    }
+    uint32_t cmask = si ? (si->cbuf_mask & 0x3FFFFu) : 0u;
+    if (!eligible || (uint32_t)__builtin_popcount(cmask) > 8u)
+        return stage_set(p, layout, set, stage, si, rscale_row0, tint, gx, gy, gz, pre_ii, dyn, ndyn);
+    Range cur_cb[8];
+    int ncb = 0;
+    for (uint32_t m = cmask; m;) {
+        int k = __builtin_ctz(m);
+        m &= m - 1u;
+        cur_cb[ncb++] = st.ubuf[stage][k];
+    }
+    float rs0_cur[4] = {1, 1, 0, 0}, tint_cur[8] = {0};
+    if (stage == 1) {
+        if (rscale_row0) memcpy(rs0_cur, rscale_row0, 16);
+        if (tint) memcpy(tint_cur, tint, 32);
+    }
+    uint64_t extra = stage == 1 ? fii_memo_active_id : (si->ntex ? st_tex_ver[0] : 0);
+    uint32_t bkt = fast2_bucket(si, layout, stage, cur_cb, ncb, extra);
+    StageFast2 *way = fast2_tab[stage][bkt];
+    extern uint32_t vk_view_gen, tex_slot_gen;
+    uint64_t pending = vk_pending_seq();
+    uint64_t cur_frame = vk_frame_counter();
+    for (int i = 0; i < 4; i++) {
+        StageFast2 *e = &way[i];
+        if (e->ds && e->si == si && e->layout == layout && e->set == (uint8_t)set &&
+            e->bank >= 0 && desc_banks[(int)e->bank].epoch == e->bank_epoch &&
+            e->rgen == desc_res_gen && e->vgen == vk_view_gen && e->sgen == tex_slot_gen &&
+            e->sbuf_ver == st_sbuf_ver[stage] && e->img_ver == st_img_ver[stage] &&
+            e->pool_ver == st_pool_ver && e->ubo_data_ver == st_stage_ubo_data_ver[stage] &&
+            e->exec_seq == g_exec_list_seq && e->epoch == chunk_epoch &&
+            e->gcopy_gen == gcopy_gen && e->frame == cur_frame && e->gmem_buf == gmem_buf &&
+            e->cbuf_mask == cmask && e->ncb == (uint8_t)ncb &&
+            (stage == 0 ? (!si->ntex || e->tex_ver == st_tex_ver[0])
+                        : (e->fii_stamp == fii_memo_active_id &&
+                           (!si->uses_rscale || (e->mir_w == g_mirror_w && !memcmp(e->rs0, rs0_cur, sizeof rs0_cur))) &&
+                           (!si->uses_tint || !memcmp(e->tint, tint_cur, sizeof tint_cur))))) {
+            bool cb_ok = true;
+            for (int c = 0; c < ncb; c++) {
+                if (e->cb[c].addr != cur_cb[c].addr || e->cb[c].size != cur_cb[c].size) { cb_ok = false; break; }
+            }
+            if (!cb_ok) continue;
+            desc_banks[(int)e->bank].last_seq = pending;
+            if (dyn && e->ndyn) memcpy(dyn, e->dyn, e->ndyn * sizeof e->dyn[0]);
+            if (ndyn) *ndyn = e->ndyn;
+            if (i > 0) {
+                StageFast2 tmp = way[i];
+                way[i] = way[0];
+                way[0] = tmp;
+            }
+            prof_set_hits++;
+            return way[0].ds;
+        }
+    }
+    VkDescriptorSet ds = stage_set(p, layout, set, stage, si, rscale_row0, tint, gx, gy, gz, pre_ii, dyn, ndyn);
+    if (ds && g_last_fast_ok && ndyn && *ndyn <= 16) {
+        StageSetFast *f0 = &fast_tab[stage][g_last_fast_bucket][0];
+        if (f0->ds == ds && f0->si == si && f0->layout == layout && f0->set == (uint8_t)set &&
+            f0->ndyn == (uint8_t)*ndyn && f0->bank >= 0 && desc_banks[(int)f0->bank].epoch == f0->bank_epoch &&
+            (*ndyn == 0 || !dyn || !memcmp(f0->dyn, dyn, *ndyn * sizeof dyn[0]))) {
+            int slot = 3;
+            for (int i = 0; i < 4; i++) {
+                StageFast2 *e = &way[i];
+                if (!e->ds || e->frame != cur_frame || e->exec_seq != g_exec_list_seq || e->epoch != chunk_epoch ||
+                    e->bank < 0 || desc_banks[(int)e->bank].epoch != e->bank_epoch) {
+                    slot = i;
+                    break;
+                }
+            }
+            for (int k = slot; k > 0; k--) way[k] = way[k - 1];
+            StageFast2 *dst = &way[0];
+            dst->si = si;
+            dst->layout = layout;
+            dst->ds = ds;
+            dst->gmem_buf = gmem_buf;
+            dst->exec_seq = g_exec_list_seq;
+            dst->epoch = chunk_epoch;
+            dst->gcopy_gen = gcopy_gen;
+            dst->frame = cur_frame;
+            dst->ubo_data_ver = st_stage_ubo_data_ver[stage];
+            dst->pool_ver = st_pool_ver;
+            dst->sbuf_ver = st_sbuf_ver[stage];
+            dst->img_ver = st_img_ver[stage];
+            dst->tex_ver = st_tex_ver[0];
+            dst->fii_stamp = fii_memo_active_id;
+            dst->rgen = desc_res_gen;
+            dst->vgen = vk_view_gen;
+            dst->sgen = tex_slot_gen;
+            dst->bank_epoch = f0->bank_epoch;
+            dst->mir_w = g_mirror_w;
+            dst->cbuf_mask = cmask;
+            dst->set = (uint8_t)set;
+            dst->ndyn = (uint8_t)*ndyn;
+            dst->ncb = (uint8_t)ncb;
+            dst->bank = f0->bank;
+            if (*ndyn && dyn) memcpy(dst->dyn, dyn, *ndyn * sizeof dyn[0]);
+            if (stage == 1) {
+                memcpy(dst->rs0, rs0_cur, sizeof rs0_cur);
+                memcpy(dst->tint, tint_cur, sizeof tint_cur);
+            }
+            if (ncb) memcpy(dst->cb, cur_cb, (size_t)ncb * sizeof cur_cb[0]);
+        }
+    }
+    return ds;
+#else
+    return stage_set(p, layout, set, stage, si, rscale_row0, tint, gx, gy, gz, pre_ii, dyn, ndyn);
+#endif
 }
 
 static void draw_(CmdRec *r, bool indexed);
@@ -8177,7 +8391,7 @@ static void draw_(CmdRec *r, bool indexed) {
     uint32_t dyn[64], ndv = 0, ndf = 0;  // (the sets' dynamic uniform buffer offsets: vertex, then fragment)
     cbw_clear();  // (cbwin_bind fills them while the sets are written)
     PROF_T0();
-    VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndv);
+    VkDescriptorSet vset = stage_set_cached(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndv);
     PROF_ADD(prof_sets);
     if (fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
         // Draws into the swapchain image (see renderer.m): composites fill the window, UI goes in a centred 16:9 box.
@@ -8226,7 +8440,7 @@ static void draw_(CmdRec *r, bool indexed) {
     apply_scissor();
     float rs0[4] = {vp_sx, vp_sy, vp_ox, vp_oy};
     uint64_t prof_t1_ = prof ? SDL_GetTicksNS() : 0;
-    VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn + ndv, &ndf);
+    VkDescriptorSet fset = stage_set_cached(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn + ndv, &ndf);
     up_fix.sx = 0;
     if (prof) prof_sets += SDL_GetTicksNS() - prof_t1_;
     VkDescriptorSet sets[2] = {vset, fset};
@@ -9382,33 +9596,32 @@ static void exec_list(uint64_t handle, int depth) {
             for (uint64_t i = 0; i < r->x[1] && r->x[0] + i < 16; i++) memcpy(&st.vbuf[r->x[0] + i], (uint8_t *)x + i * 16, 16);
             break;
         case CMD_BIND_UNIFORM_BUFFERS:
-            for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 18 && r->x[0] < 6; i++)
-                memcpy(&st.ubuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
-            if (r->x[0] < 6) st_ubuf_ver[r->x[0]]++;
+            bind_state_slots(st.ubuf, sizeof st.ubuf[0][0], 18, r->x[0], r->x[1], r->x[2], x, st_ubuf_ver);
             break;
         case CMD_BIND_STORAGE_BUFFERS:
-            for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 16 && r->x[0] < 6; i++)
-                memcpy(&st.sbuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
-            if (r->x[0] < 6) st_sbuf_ver[r->x[0]]++;
+            bind_state_slots(st.sbuf, sizeof st.sbuf[0][0], 16, r->x[0], r->x[1], r->x[2], x, st_sbuf_ver);
             break;
         case CMD_BIND_TEXTURES:
-            for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
-                memcpy(&st.tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
-            if (r->x[0] < 6) st_tex_ver[r->x[0]]++;
+            bind_state_slots(st.tex, sizeof st.tex[0][0], 32, r->x[0], r->x[1], r->x[2], x, st_tex_ver);
             break;
         case CMD_BIND_TEXTURES_DEFERRED:  // (stage, first, count, handles): the handles as they are now
-            if (r->x[3] >= GUEST_LO && r->x[3] + r->x[2] * 8 <= GUEST_HI)
-                for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
-                    memcpy(&st.tex[r->x[0]][r->x[1] + i], (const uint8_t *)(uintptr_t)r->x[3] + i * 8, 8);
-            if (r->x[0] < 6) st_tex_ver[r->x[0]]++;
+            if (r->x[3] >= GUEST_LO && r->x[3] <= GUEST_HI && r->x[2] <= (GUEST_HI - r->x[3]) / 8)
+                bind_state_slots(st.tex, sizeof st.tex[0][0], 32, r->x[0], r->x[1], r->x[2],
+                                 (const void *)(uintptr_t)r->x[3], st_tex_ver);
             break;
         case CMD_BIND_IMAGES:
-            for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 8 && r->x[0] < 6; i++)
-                memcpy(&st.img[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
-            if (r->x[0] < 6) st_img_ver[r->x[0]]++;
+            bind_state_slots(st.img, sizeof st.img[0][0], 8, r->x[0], r->x[1], r->x[2], x, st_img_ver);
             break;
-        case CMD_SET_TEXTURE_POOL: st.tpool = (NvnDescPool *)(uintptr_t)r->x[0]; st_pool_ver++; break;
-        case CMD_SET_SAMPLER_POOL: st.spool = (NvnDescPool *)(uintptr_t)r->x[0]; st_pool_ver++; break;
+        case CMD_SET_TEXTURE_POOL: {
+            NvnDescPool *tp = (NvnDescPool *)(uintptr_t)r->x[0];
+            if (st.tpool != tp) { st.tpool = tp; st_pool_ver++; }
+            break;
+        }
+        case CMD_SET_SAMPLER_POOL: {
+            NvnDescPool *sp_ = (NvnDescPool *)(uintptr_t)r->x[0];
+            if (st.spool != sp_) { st.spool = sp_; st_pool_ver++; }
+            break;
+        }
         case CMD_SET_RENDER_TARGETS: {
             const struct { uint64_t tex[8]; NvnTextureView views[8]; uint8_t has_view[8]; uint64_t depth;
                            NvnTextureView dview; uint8_t has_dview; } *rt = x;

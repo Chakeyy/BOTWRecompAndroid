@@ -189,7 +189,7 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
         }
         g_guest_lo = base;
         fprintf(stderr, "[android] guest window %#llx-%#llx\n", (unsigned long long)base, (unsigned long long)(base + hi - lo));
-        fprintf(stderr, "[BOTW-Opt r09] Helio G99 / Mali-G57 Optimization Suite Active\n");
+        fprintf(stderr, "[BOTW-Opt r10] Helio G99 / Mali-G57 Optimization Suite Active\n");
         const char *last = getenv("LARECOMP_LAST_EXIT");  // (the activity: ApplicationExitInfo)
         if (last && *last) fprintf(stderr, "[android] the last run ended: %s\n", last);
         const char *boot = getenv("LARECOMP_BOOT_STATE");
@@ -414,7 +414,16 @@ int plat_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int max, u
         }
     }
     for (uint64_t p = p0; p < p1;) {
-        if (wt_state[p] == 1) { p++; continue; }
+        // Fast-skip tracked clean pages (state == 1) 8 pages at a time under wt_lock.
+        while (p < p1 && ((((uintptr_t)(wt_state + p)) & 7u) != 0) && wt_state[p] == 1) p++;
+        while (p + 8 <= p1) {
+            uint64_t w;
+            memcpy(&w, wt_state + p, 8);
+            if (w != 0x0101010101010101ull) break;
+            p += 8;
+        }
+        while (p < p1 && wt_state[p] == 1) p++;
+        if (p >= p1) break;
         uint64_t q = p;
         for (; q < p1 && wt_state[q] != 1; q++) {
             if (n < max) pages[n] = wt_lo + (q << 12);
