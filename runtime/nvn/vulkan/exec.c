@@ -2229,7 +2229,7 @@ static uint64_t wb_max(void) {  // (LARECOMP_WRITEBACK_MAX=<bytes>: a larger lim
 // slots of 512 KB each - all of them sized for a terrain tile - were full every frame once its previous one was still
 // on the GPU: the CPU waited for the GPU ~12 times a second, and the game stuttered (2026-10-27, 8,700 waits in 20
 // minutes). Now four frames of small ones fit, in about as much memory as before.
-#define WB_SMALL 128
+#define WB_SMALL 256
 #define WB_BIG 32
 #define WB_SLOTS (WB_SMALL + WB_BIG)
 typedef struct { uint64_t seq, addr, pitch, off, order; uint32_t wb, hb, bpb, bh, fmt, size; bool busy; } WbEntry;  // (pitch: linear rows, 0: block-linear; off, size: its slot in wb_buf; order: when queued)
@@ -2283,6 +2283,8 @@ static bool wb_eligible(NvnTexture *t, TexBackend *b, uint32_t lv) {
     return t->addr >= HEAP_BASE && tegra_total_size(&t->layout) <= ((lin && (t->flags & 0x50)) ? WB_SLOT : WB_MAX);
 }
 
+static void wb_apply(uint64_t done);
+
 static void wb_queue(NvnTexture *t) {
     TexBackend *b = t->backend;
     pthread_mutex_lock(&wb_lock);
@@ -2304,6 +2306,15 @@ static void wb_queue(NvnTexture *t) {
     int *next = small ? &wb_next_small : &wb_next_big;
     int base = small ? 0 : WB_SMALL, count = small ? WB_SMALL : WB_BIG;
     WbEntry *e = &wb_ent[base + *next];
+    if (e->busy) {
+        uint64_t done = vk_completed_seq();
+        if (e->seq <= done) {
+            pthread_mutex_unlock(&wb_lock);
+            wb_apply(done);
+            pthread_mutex_lock(&wb_lock);
+            e = &wb_ent[base + *next];
+        }
+    }
     if (e->busy) {
         // Every slot still waits for the GPU. Dropped, the target's texels never reached memory: a tower's cutscene
         // draws the region's terrain height tiles (8 levels of 256x256 a tile) in a burst, the heights stayed stale and
@@ -3884,7 +3895,7 @@ static int pipe_keep(void) {
             }
             keep = (total_kb >= 7L * 1024 * 1024) ? 4096 : 1500;
         } else if (g_vk.props.vendorID == 0x13B5 && !vk_low_ram()) {
-            keep = 1000;
+            keep = 2400;
         } else {
             keep = 800;
         }
@@ -3907,8 +3918,8 @@ static void pipe_evict(void) {
     if (live <= keep) return;
     uint64_t done = vk_completed_seq();
     int target = keep * 4 / 5, gone = 0;
-    // oldest first: two passes, shorter windows when conserving RAM
-    const bool short_win = vk_low_ram() || vk_conserve_ram();
+    // oldest first: two passes, shorter windows on low-RAM devices
+    const bool short_win = vk_low_ram();
     const uint64_t ages[2] = {
         short_win ? 90000000000ull : 600000000000ull,
         short_win ? 30000000000ull : 180000000000ull,
@@ -6465,7 +6476,7 @@ static uint64_t vc_budget(void) {
     return b;
 }
 #define VC_BUDGET vc_budget()
-typedef struct { uint64_t lo, hi, used_seq; uint32_t gen, epoch; VkBuffer buf; VmaAllocation mem; bool gpu; } VcEnt;
+typedef struct { uint64_t lo, hi, used_seq; uint32_t gen, epoch, used_frame, clean_streak; VkBuffer buf; VmaAllocation mem; bool gpu; } VcEnt;
 static VcEnt vc_tab[VC_TAB];
 static uint32_t vc_pend[VC_TAB];  // entries the pending submission draws from (vc_flush brings them up to date)
 static int vc_npend;
@@ -6623,9 +6634,14 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
         e->epoch = vc_epoch;
     }
     if (e->gpu) { prof_vc_bypass++; return false; }
-    if (e->used_seq != pend) {  // first use in this submission: brought up to date by vc_flush before it runs
-        e->used_seq = pend;
-        vc_pend[vc_npend++] = (uint32_t)(e - vc_tab);
+    e->used_seq = pend;
+    extern bool framepace_in_menu(void);
+    uint32_t cur_frame32 = (uint32_t)vk_frame_counter() + 1u;
+    if (!e->gen || e->used_frame != cur_frame32) {
+        e->used_frame = cur_frame32;
+        uint32_t idx = (uint32_t)(e - vc_tab);
+        if (!e->gen || e->clean_streak < 8u || ((cur_frame32 + idx) & 7u) == 0u || framepace_in_menu())
+            vc_pend[vc_npend++] = idx;
     }
     prof_vc_hits++;
     *buf = e->buf;
@@ -6686,6 +6702,11 @@ void vc_flush(void) {
             copy_buffer(cb, sp.buf, e->buf, (uint32_t)nc, cp);
         }
         for (int k = 0; k < nc; k++) prof_vc_copied += cp[k].size;
+        if (!nc) {
+            if (e->clean_streak < 255u) e->clean_streak++;
+        } else {
+            e->clean_streak = e->gen ? 0u : 1u;
+        }
         e->gen = g;
     }
     vc_npend = 0;
@@ -7471,6 +7492,12 @@ static CsProg *compute_program(NvnProgram *np) {
     }
 #endif
     cp->si = maxwell_translate((const uint8_t *)(uintptr_t)ss->code_addr, ss->const_offset ? ss->const_offset : 0x10000, STAGE_COMPUTE, &k);
+    if (cp->si) {
+        for (int i = 0; i < cp->si->ntex; i++) {
+            if (cp->si->tex[i].bindless) cp->p.vi_bindless = true;
+            if (cp->si->tex[i].is_image) cp->p.vi_image = true;
+        }
+    }
     pthread_mutex_unlock(&translate_lock);
     cp->p.vi = cp->si;
     if (!cp->si->msl) {
@@ -7488,7 +7515,6 @@ static CsProg *compute_program(NvnProgram *np) {
 }
 
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
-    snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
     {   extern uint64_t nvn_watch_texaddr(void);
         uint64_t wa = nvn_watch_texaddr();
@@ -7499,6 +7525,10 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
                     (unsigned long long)st.sbuf[5][i].size);
     }
     CsProg *cp = compute_program(st.program);
+    if (!cp || cp->p.vi_image) {
+        snap_reason = "compute";
+        snapshots_invalidate(NULL);
+    }
     if (cp && !atomic_load(&cp->p.state)) stat_skipped_building++;
     if (!cp || atomic_load(&cp->p.state) != 1) { stat_skipped++; return; }
     {   // LARECOMP_SKIP_CS=<code address hex>[,...] (debug): skip those compute shaders' dispatches, to see what they do;
@@ -7536,9 +7566,11 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     VkCommandBuffer cb = vk_cmd();
     bool chained = dchain && cb == dchain_cb && dchain_ok();
     if (chained) stat_dchained++;
-    else vk_full_barrier(cb);
+    else {
+        vk_full_barrier(cb);
+        dchain_after = false;
+    }
     dchain = false;
-    dchain_after = false;
     gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u) cs %llx gmem %d", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2],
             (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
     dl_note("dispatch %ux%ux%u cs %llx gmem %d", gx, gy, gz, (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
@@ -7566,7 +7598,8 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     if (cp->si->uses_gmem_store) vc_mark_sbufs(5), note_gmem_store(5);
     stat_dispatches++;
 #ifdef __ANDROID__
-    dchain = !gcopy_mode && !gfast_n;  // (a copy mode's ranges go through gfast_buf: those keep their barriers)
+    dchain = (!gcopy_mode || gres_state == 1) && !gfast_n;  // (resident arena slots don't overwrite gfast_buf)
+    if (dchain && (cp->si->uses_gmem_store || cp->p.vi_image)) dchain_after = true;
 #endif
     dchain_cb = cb;
 }
@@ -9696,7 +9729,13 @@ static void exec_list(uint64_t handle, int depth) {
             dchain_after = false;
         }
         switch (r->op) {
-        case CMD_END: return;
+        case CMD_END:
+            if (depth == 0 && dchain) {
+                dchain = false;
+                if (dchain_after) vk_full_barrier(vk_cmd());
+                dchain_after = false;
+            }
+            return;
         case CMD_JUMP: p = r->x[0]; continue;
         case CMD_CALL: {
             const uint64_t *h = x;

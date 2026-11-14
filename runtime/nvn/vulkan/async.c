@@ -76,6 +76,8 @@ static uint64_t render_cpu_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+static void snap_free(void *p);
+
 static void *render_main(void *arg) {
     (void)arg;
     extern void plat_thread_unpin(void);
@@ -96,7 +98,7 @@ static void *render_main(void *arg) {
         uint64_t t0 = plat_now_ns(), cpu0 = cpu_timing ? render_cpu_ns() : 0;
         extern void vk_tl(const char *what, uint64_t a, uint64_t b);  // (exec.c: LARECOMP_FRAME_TIMELINE)
         vk_tl(r.type == REQ_EXEC ? "render: list start" : r.type == REQ_PRESENT ? "render: present start" : "render: fence", r.id, 0);
-        if (r.type == REQ_EXEC) { vk_execute_now(r.a); free(r.p); }  // (r.p: the list copy, vk_async_execute)
+        if (r.type == REQ_EXEC) { vk_execute_now(r.a); snap_free(r.p); }  // (r.p: the list copy, vk_async_execute)
         else if (r.type == REQ_PRESENT) vk_present_now((NvnTexture *)r.p, r.a);
         else if (r.type == REQ_CALL) { ((void (*)(void *))(uintptr_t)r.a)(r.p); free(r.p); }
         if (r.type == REQ_EXEC || r.type == REQ_PRESENT) vk_tl(r.type == REQ_EXEC ? "render: list end" : "render: present end", r.id, 0);
@@ -209,11 +211,57 @@ static void snap_add(Snap *s, uint64_t p, int depth) {
         p += r->size;
     }
 }
+#define SNAP_POOL_N 32
+#define SNAP_KEEP_CAP (2u << 20)
+typedef struct { uint8_t *b; size_t cap; bool in_use; } SnapSlot;
+static SnapSlot snap_pool[SNAP_POOL_N];
+static pthread_mutex_t snap_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void snap_free(void *p) {
+    if (!p) return;
+    pthread_mutex_lock(&snap_lock);
+    for (int i = 0; i < SNAP_POOL_N; i++) {
+        if (snap_pool[i].b == p) {
+            if (snap_pool[i].cap > SNAP_KEEP_CAP) {
+                free(snap_pool[i].b);
+                snap_pool[i].b = NULL;
+                snap_pool[i].cap = 0;
+            }
+            snap_pool[i].in_use = false;
+            pthread_mutex_unlock(&snap_lock);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&snap_lock);
+    free(p);
+}
+
 static uint8_t *snap_list(uint64_t handle) {
+    int slot = -1;
     Snap s = {0};
+    pthread_mutex_lock(&snap_lock);
+    for (int i = 0; i < SNAP_POOL_N; i++) {
+        if (!snap_pool[i].in_use) {
+            snap_pool[i].in_use = true;
+            s.b = snap_pool[i].b;
+            s.cap = snap_pool[i].cap;
+            slot = i;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&snap_lock);
     snap_add(&s, handle, 0);
-    s.b = realloc(s.b, s.n + sizeof(CmdRec));
-    if (!s.b) FATAL("vk: out of memory for a command list copy\n");
+    if (s.n + sizeof(CmdRec) > s.cap) {
+        s.cap = (s.n + sizeof(CmdRec)) * 2 > 0x10000 ? (s.n + sizeof(CmdRec)) * 2 : 0x10000;
+        s.b = realloc(s.b, s.cap);
+        if (!s.b) FATAL("vk: out of memory for a command list copy\n");
+    }
+    if (slot >= 0) {
+        pthread_mutex_lock(&snap_lock);
+        snap_pool[slot].b = s.b;
+        snap_pool[slot].cap = s.cap;
+        pthread_mutex_unlock(&snap_lock);
+    }
     memset(s.b + s.n, 0, sizeof(CmdRec));  // CMD_END
     ((CmdRec *)(s.b + s.n))->size = sizeof(CmdRec);
     return s.b;
