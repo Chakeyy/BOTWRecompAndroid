@@ -54,6 +54,11 @@ typedef struct {
                                   // 2's) baked into pipelines (exec.c PipeKey.fx)
     bool eds2;                    // extended dynamic state 2 in use; without it, depth bias and primitive restart are
                                   // pipeline state (exec.c PipeKey.prim_restart)
+    bool feedback_loop;           // VK_EXT_attachment_feedback_loop_layout enabled (in-place target reads)
+    bool feedback_loop_dyn;       // VK_EXT_attachment_feedback_loop_dynamic_state available
+    bool raster_order;            // VK_ARM / VK_EXT_rasterization_order_attachment_access available
+    bool local_read;              // VK_KHR_dynamic_rendering_local_read available
+    bool unified_layouts;         // VK_KHR_unified_image_layouts available
 #ifdef __ANDROID__
     bool map_placed;              // VK_EXT_map_memory_placed: the guest heap mapped as GPU memory (exec.c vk_heap_place)
     bool mem_fd;                  // VK_KHR_external_memory_fd: the same through an exported file mapped there (vk_heap_place)

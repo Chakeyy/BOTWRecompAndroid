@@ -189,7 +189,7 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
         }
         g_guest_lo = base;
         fprintf(stderr, "[android] guest window %#llx-%#llx\n", (unsigned long long)base, (unsigned long long)(base + hi - lo));
-        fprintf(stderr, "[BOTW-Opt r07] Helio G99 / Mali-G57 Optimization Suite Active\n");
+        fprintf(stderr, "[BOTW-Opt r08] Helio G99 / Mali-G57 Optimization Suite Active\n");
         const char *last = getenv("LARECOMP_LAST_EXIT");  // (the activity: ApplicationExitInfo)
         if (last && *last) fprintf(stderr, "[android] the last run ended: %s\n", last);
         const char *boot = getenv("LARECOMP_BOOT_STATE");
@@ -753,6 +753,27 @@ JNIEXPORT void JNICALL Java_com_botwrecompandroid_BOTWRecompAndroidActivity_nati
     LOG("[android] memory pressure level %d: available %llu MB / %llu MB, low threshold %llu MB, low %d, process PSS %d MB\n",
         level, (unsigned long long)available >> 20, (unsigned long long)total >> 20,
         (unsigned long long)threshold >> 20, low != 0, pss / 1024);
+    if (low || level >= 15) {
+#ifdef M_PURGE
+        mallopt(M_PURGE, 0);
+#endif
+        FILE *f = fopen("/proc/self/smaps_rollup", "re");
+        if (f) {
+            char line[128];
+            long rss_kb = -1, pss_kb = -1, swap_pss_kb = -1;
+            while (fgets(line, sizeof line, f)) {
+                long v = 0;
+                if (sscanf(line, "Rss: %ld kB", &v) == 1) rss_kb = v;
+                else if (sscanf(line, "Pss: %ld kB", &v) == 1) pss_kb = v;
+                else if (sscanf(line, "SwapPss: %ld kB", &v) == 1) swap_pss_kb = v;
+            }
+            fclose(f);
+            if (rss_kb >= 0 || pss_kb >= 0 || swap_pss_kb >= 0)
+                LOG("[android] smaps_rollup: RSS %ld MB, PSS %ld MB, SwapPSS %ld MB\n",
+                    rss_kb >= 0 ? rss_kb >> 10 : -1L, pss_kb >= 0 ? pss_kb >> 10 : -1L,
+                    swap_pss_kb >= 0 ? swap_pss_kb >> 10 : -1L);
+        }
+    }
 }
 
 JNIEXPORT void JNICALL Java_com_botwrecompandroid_BOTWRecompAndroidActivity_nativeDeviceStats(JNIEnv *env, jclass cls, jfloat batt_temp_c,
@@ -985,10 +1006,14 @@ static void init_little_cores(void) {
 void plat_worker_thread_pin(void) {
     mallopt(M_BIONIC_ZERO_INIT, 1);
     const char *e = getenv("LARECOMP_WORKER_LITTLE");
-    if (e && !atoi(e)) return;
-    pthread_once(&g_little_once, init_little_cores);
-    if (g_have_little) sched_setaffinity(0, sizeof g_little_set, &g_little_set);
-    setpriority(PRIO_PROCESS, 0, 10);
+    if (e && atoi(e) != 0) {
+        pthread_once(&g_little_once, init_little_cores);
+        if (g_have_little) sched_setaffinity(0, sizeof g_little_set, &g_little_set);
+        setpriority(PRIO_PROCESS, 0, 10);
+        return;
+    }
+    if (g_pinned) sched_setaffinity(0, sizeof g_all_cores, &g_all_cores);
+    setpriority(PRIO_PROCESS, 0, 4);
 }
 
 static void pin_to_fastest_cores(void) {

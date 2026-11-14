@@ -477,6 +477,14 @@ static void create_device(void) {
     VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5_have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executable_have = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT feedback_have = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT};
+    VkPhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT feedback_dyn_have = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_FEATURES_EXT};
+    VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT raster_order_have = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT};
+    VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR local_read_have = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
     VkPhysicalDeviceFeatures2 optional = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
 #define QUERY_OPTIONAL(name, feature) do { if (has_ext(ep, ne, name)) { \
         feature.pNext = optional.pNext; optional.pNext = &feature; } } while (0)
@@ -485,6 +493,14 @@ static void create_device(void) {
     QUERY_OPTIONAL(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, fault_have);
     QUERY_OPTIONAL(VK_KHR_MAINTENANCE_5_EXTENSION_NAME, maintenance5_have);
     QUERY_OPTIONAL(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, executable_have);
+    QUERY_OPTIONAL(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME, feedback_have);
+    QUERY_OPTIONAL(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME, feedback_dyn_have);
+    if (has_ext(ep, ne, VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME) ||
+        has_ext(ep, ne, VK_ARM_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME)) {
+        raster_order_have.pNext = optional.pNext;
+        optional.pNext = &raster_order_have;
+    }
+    QUERY_OPTIONAL(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME, local_read_have);
 #undef QUERY_OPTIONAL
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &optional);
 #endif
@@ -869,6 +885,31 @@ static void create_device(void) {
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pex = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR, .pipelineExecutableInfo = VK_TRUE};
     if (g_vk.exec_stats) { pex.pNext = f.pNext; f.pNext = &pex; }
+    bool feedback_ext = has_ext(ep, ne, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
+    g_vk.feedback_loop_dyn = has_ext(ep, ne, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME) &&
+                             feedback_dyn_have.attachmentFeedbackLoopDynamicState;
+    g_vk.raster_order = (has_ext(ep, ne, VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME) ||
+                         has_ext(ep, ne, VK_ARM_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME)) &&
+                        raster_order_have.rasterizationOrderColorAttachmentAccess;
+    g_vk.local_read = has_ext(ep, ne, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME) &&
+                      local_read_have.dynamicRenderingLocalRead;
+    g_vk.unified_layouts = has_ext(ep, ne, "VK_KHR_unified_image_layouts");
+    g_vk.feedback_loop = feedback_ext && feedback_have.attachmentFeedbackLoopLayout &&
+                         g_vk.dyn_render && g_vk.sync2 &&
+                         !env_on("LARECOMP_NO_FEEDBACK_LAYOUT") &&
+                         !env_on("LARECOMP_FEEDBACK_COPY") &&
+                         g_settings.inplace_reads != 0;
+    VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT fbl_feat = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT,
+        .attachmentFeedbackLoopLayout = VK_TRUE};
+    if (g_vk.feedback_loop) {
+        ext[n_ext++] = VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME;
+        fbl_feat.pNext = f.pNext;
+        f.pNext = &fbl_feat;
+    }
+    LOG("[vk-cap] feedback-loop %u (ext %u feat %u) feedback-dyn %u raster-order %u local-read %u unified-layouts %u\n",
+        g_vk.feedback_loop, feedback_ext, feedback_have.attachmentFeedbackLoopLayout,
+        g_vk.feedback_loop_dyn, g_vk.raster_order, g_vk.local_read, g_vk.unified_layouts);
 #endif
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
@@ -1648,6 +1689,9 @@ void backend_present(NvnTexture *t) {
         if (shot && getenv("LARECOMP_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
     } else {
         renderer_submit();
+#ifdef __ANDROID__
+        if (!android_window()) SDL_Delay(50);
+#endif
     }
     extern void vk_prof_frame(uint64_t frame, uint64_t present_ns);
     vk_prof_frame(total_frames, SDL_GetTicksNS() - t0);

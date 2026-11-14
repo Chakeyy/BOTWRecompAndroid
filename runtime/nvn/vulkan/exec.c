@@ -147,8 +147,8 @@ static _Atomic uint64_t sw_submitted;
 static void *seq_waiter(void *arg) {
     (void)arg;
 #ifdef __ANDROID__
-    extern void plat_worker_thread_pin(void);
-    plat_worker_thread_pin();
+    extern void plat_thread_unpin(void);
+    plat_thread_unpin();
 #endif
     for (;;) {
         pthread_mutex_lock(&sw_m);
@@ -1053,6 +1053,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
         pthread_mutex_unlock(&cq_lock);
     }
 #endif
+    if (g_gpuprof_frame && gp_n) gp_mark(s->main, "submit end (CPU gap before next submit)");
     if (s->ts) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
     VK_CHECK(vkEndCommandBuffer(s->main));
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
@@ -1188,14 +1189,15 @@ static int cur_desc_bank;
 static uint32_t desc_res_gen = 1;
 
 static VkDescriptorSet persist_alloc_set(VkDescriptorSetLayout layout, int *bank_out) {
-    const bool conserve = vk_conserve_ram();
-    const int nbanks = conserve ? 4 : DESC_BANKS;
-    const uint32_t max_sets = conserve ? 3072u : DESC_BANK_MAX_SETS;
+    extern bool vk_low_ram(void);
+    const bool low = vk_low_ram();
+    const int nbanks = low ? 4 : DESC_BANKS;
+    const uint32_t max_sets = low ? 3072u : DESC_BANK_MAX_SETS;
+    const uint32_t div = low ? 2u : 1u;
     for (int tries = 0; tries < nbanks; tries++) {
-        if (cur_desc_bank >= nbanks) cur_desc_bank = 0;
-        DescBank *b = &desc_banks[cur_desc_bank];
+        int idx = (cur_desc_bank + tries) % nbanks;
+        DescBank *b = &desc_banks[idx];
         if (!b->pool) {
-            const uint32_t div = conserve ? 2u : 1u;
             VkDescriptorPoolSize sizes[] = {
                 {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 24576u / div},
                 {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096u / div},
@@ -1225,21 +1227,50 @@ static VkDescriptorSet persist_alloc_set(VkDescriptorSetLayout layout, int *bank
             VkDescriptorSet set;
             if (vkAllocateDescriptorSets(g_vk.dev, &ai, &set) == VK_SUCCESS) {
                 b->used++;
-                *bank_out = cur_desc_bank;
+                cur_desc_bank = idx;
+                *bank_out = idx;
                 return set;
             }
+            b->used = max_sets;
         }
-        int next = (cur_desc_bank + 1) % nbanks;
-        DescBank *nb = &desc_banks[next];
-        if (nb->pool) {
-            if (nb->last_seq > submit_seq) { cur_desc_bank = next; continue; }
-            if (nb->last_seq) vk_wait_seq(nb->last_seq);
-            VK_CHECK(vkResetDescriptorPool(g_vk.dev, nb->pool, 0));
-            nb->used = 0;
-            nb->epoch++;
-            if (!nb->epoch) nb->epoch = 1;
+    }
+    uint64_t done = vk_completed_seq();
+    int pick = -1;
+    for (int tries = 1; tries <= nbanks; tries++) {
+        int idx = (cur_desc_bank + tries) % nbanks;
+        DescBank *b = &desc_banks[idx];
+        if (b->pool && b->last_seq <= done) { pick = idx; break; }
+    }
+    if (pick < 0) {
+        uint64_t best_seq = UINT64_MAX;
+        for (int idx = 0; idx < nbanks; idx++) {
+            DescBank *b = &desc_banks[idx];
+            if (b->pool && b->last_seq <= submit_seq && b->last_seq < best_seq) {
+                best_seq = b->last_seq;
+                pick = idx;
+            }
         }
-        cur_desc_bank = next;
+    }
+    if (pick >= 0) {
+        DescBank *nb = &desc_banks[pick];
+        if (nb->last_seq > done) { if (!wait_why) wait_why = "desc bank"; vk_wait_seq(nb->last_seq); }
+        VK_CHECK(vkResetDescriptorPool(g_vk.dev, nb->pool, 0));
+        nb->used = 0;
+        nb->epoch++;
+        if (!nb->epoch) nb->epoch = 1;
+        cur_desc_bank = pick;
+        VkDescriptorSetAllocateInfo ai = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = nb->pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &layout
+        };
+        VkDescriptorSet set;
+        if (vkAllocateDescriptorSets(g_vk.dev, &ai, &set) == VK_SUCCESS) {
+            nb->used = 1;
+            *bank_out = pick;
+            return set;
+        }
     }
     *bank_out = -1;
     return vk_alloc_set(layout);
@@ -1307,7 +1338,7 @@ bool vk_conserve_ram(void) {
     }
     return cons;
 }
-#define CHUNK_SIZE (vk_conserve_ram() ? 16ull << 20 : 64ull << 20)
+#define CHUNK_SIZE (vk_low_ram() ? 16ull << 20 : 64ull << 20)
 #define RING_KEEP (vk_conserve_ram() ? 2 : 4)
 typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t size, used, seq, frame; } Chunk;  // frame: last picked
 static Chunk *chunks;
@@ -1635,7 +1666,8 @@ static void run_job(void (*fn)(void *), void *arg) {
         int n = cores - 4;
 #ifdef __ANDROID__
         n = cores / 2;
-        if (n > 3) n = 3;  // leave CPU capacity on Little cores and keep Big cores free
+        int max_w = vk_low_ram() ? 2 : (cores >= 8 ? 4 : 3);
+        if (n > max_w) n = max_w;
 #endif
         const char *workers = getenv("LARECOMP_SHADER_WORKERS");
         if (workers) n = atoi(workers);
@@ -2323,6 +2355,30 @@ static void vk_end_pass_at(int line);
 static void save_texture_raw(TexBackend *b, const char *path);
 static TexBackend *pass_dump_b;  // (debug frame) the color target the open pass draws into
 static uint32_t pass_dump_layer = ~0u;  // (a depth-only pass: its depth target's layer, dumped as red)
+static NvnTexture *inplace_tex[4];      // (targets this draw samples in place while writing them: resolve_feedback)
+static int ninplace, nfeedback;
+static int g_inplace_copy = -1;         // (those targets copied instead; -1: not decided yet this boot - vk_exec_reset)
+typedef struct { TexBackend *back; VkImage image; VkImageAspectFlags aspect; } PassFbBack;
+static PassFbBack pass_fb_backs[8];
+static int n_pass_fb;
+static uint8_t pass_fb_pipe_bits;       // bit 0: color feedback layout, bit 1: depth/stencil feedback layout
+static bool tex_in_pass_fb(const TexBackend *b) {
+    if (!b) return false;
+    for (int i = 0; i < n_pass_fb; i++) if (pass_fb_backs[i].back == b) return true;
+    return false;
+}
+static bool tex_in_inplace(const NvnTexture *t) {
+    if (!t) return false;
+    for (int i = 0; i < ninplace; i++) {
+        if (inplace_tex[i] == t) return true;
+        if (inplace_tex[i] && inplace_tex[i]->backend && inplace_tex[i]->backend == t->backend) return true;
+    }
+    return false;
+}
+static void pass_fb_record(TexBackend *b) {
+    if (!b || !b->image || n_pass_fb >= 8 || tex_in_pass_fb(b)) return;
+    pass_fb_backs[n_pass_fb++] = (PassFbBack){b, b->image, b->aspect};
+}
 void vk_end_pass(void) { vk_end_pass_at(0); }
 #define vk_end_pass() vk_end_pass_at(__LINE__)
 static void vk_end_pass_at(int line) {
@@ -2330,6 +2386,39 @@ static void vk_end_pass_at(int line) {
     if (prof && line < 4096) prof_end_line[line]++;
     vk_end_rendering(vk_cmd());
     in_pass = false;
+    if (n_pass_fb) {
+        VkImageMemoryBarrier2 bars[8];
+        int nb = 0;
+        for (int i = 0; i < n_pass_fb; i++) {
+            if (!pass_fb_backs[i].image) continue;
+            bars[nb++] = (VkImageMemoryBarrier2){
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .image = pass_fb_backs[i].image,
+                .subresourceRange = {pass_fb_backs[i].aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS},
+            };
+        }
+        if (nb) {
+            VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                   .imageMemoryBarrierCount = (uint32_t)nb, .pImageMemoryBarriers = bars};
+            vkCmdPipelineBarrier2(vk_cmd(), &di);
+        }
+        n_pass_fb = 0;
+        pass_fb_pipe_bits = 0;
+    }
     {   extern TexBackend *g_dump_sampled;
         if (g_dump_sampled) { TexBackend *db = g_dump_sampled; g_dump_sampled = NULL; dump_layers_raw(db); }
     }
@@ -2428,30 +2517,18 @@ static void begin_pass(void) {
         // (~6 + ~11 ms) was the frame's critical path: the game waits on the previous frame's fence.
         extern bool vk_async_on(void);
         static long chunk = -1;
-        static bool chunk_env;
         if (chunk < 0) {
             // (not on Qualcomm's driver: its render thread is slow - ~12 ms a frame in the copy mode - so the GPU sat
             // idle between the chunks, and the game, timing its frames on the GPU from start to end, saw the gaps as
             // GPU time and stayed at 30 even indoors; a whole frame at once, it chose 60 there)
             extern bool vk_driver_is_qualcomm(void);
             const char *e = getenv("LARECOMP_VK_CHUNK_US");
-            chunk_env = e != NULL;
-            // Overlap Mali TBDR execution with CPU command translation at pass boundaries without excessive queue submits.
-            chunk = e ? atol(e) : vk_driver_is_qualcomm() ? 0 : g_vk.props.vendorID == 0x13B5 ? 8000 : 2000;
+            chunk = e ? atol(e) : vk_driver_is_qualcomm() ? 0 : g_vk.props.vendorID == 0x13B5 ? 4000 : 2000;
         }
-        static uint64_t chunk_frame;
-        static uint32_t chunk_submits;
-        uint64_t cf = vk_frame_counter();
-        if (cf != chunk_frame) { chunk_frame = cf; chunk_submits = 0; }
         extern int vk_ab(const char *what);
         long ch = chunk > 0 && AB("chunk") == 1 ? 500 : chunk;
-        if (!chunk_env && ch > 0 && g_vk.props.vendorID == 0x13B5 && AB("chunk") != 1) {
-            if (chunk_submits >= 6) ch *= 4;
-            else if (chunk_submits >= 3) ch *= 2;
-        }
         if (ch > 0 && vk_async_on() && last_submit_ns && SDL_GetTicksNS() - last_submit_ns > (uint64_t)ch * 1000 && !no_chunks_now()) {
             renderer_submit();
-            chunk_submits++;
         }
     }
 #endif
@@ -2502,6 +2579,8 @@ static void begin_pass(void) {
         g_pass_layer = st.rt.ncolor && st.rt.has_cview[0] && (st.rt.cview[0].setmask & 2) ? st.rt.cview[0].min_layer : 0;
         if (st.rt.ncolor && st.rt.has_cview[0] && (st.rt.cview[0].setmask & 1) && st.rt.cview[0].base_level) g_pass_layer = -1;  // (mips: not these)
     }
+    n_pass_fb = 0;
+    pass_fb_pipe_bits = 0;
     wb_npass = 0;
     for (int i = 0; i < st.rt.ncolor; i++) {
         NvnTexture *t = st.rt.color[i];
@@ -2539,7 +2618,9 @@ static void begin_pass(void) {
             ew = level_extent(b->width, lv), eh = level_extent(b->height, lv);
         }
         ca[i].imageView = v;
-        ca[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ca[i].imageLayout = (g_vk.feedback_loop && !g_inplace_copy && !bc_shadow && tex_in_inplace(t))
+                                ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+                                : VK_IMAGE_LAYOUT_GENERAL;
         ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         bool fresh = (int)renderer_texture_level_fresh(t) | (int)renderer_texture_frame_fresh(t);  // both: each marks its state
@@ -2577,8 +2658,11 @@ static void begin_pass(void) {
         TexBackend *b = st.rt.depth->backend;
         if (v && renderer_format_is_depth(st.rt.depth->format)) {
             if (b) b->rendered_serial = g_gpu_write_serial;
+            VkImageLayout dlay = (g_vk.feedback_loop && !g_inplace_copy && tex_in_inplace(st.rt.depth))
+                                     ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
+                                     : VK_IMAGE_LAYOUT_GENERAL;
             VkRenderingAttachmentInfo a = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v,
-                                           .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+                                           .imageLayout = dlay, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
                                            .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
             if (b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) { da = a; has_d = true; pass_depth = b->format; }
             if (b->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) { sa = a; has_s = true; pass_stencil = b->format; }
@@ -2652,6 +2736,51 @@ static void begin_pass(void) {
                 LOG("[vk] DEAD VIEW in a pass: slot %d tex %p addr %llx %ux%u nvn %#x backend %p image %p frame %llu\n", bad,
                     (void *)t, t ? (unsigned long long)t->addr : 0ull, t ? t->width : 0, t ? t->height : 0, t ? t->format : 0,
                     (void *)b, b ? (void *)b->image : NULL, (unsigned long long)vk_frame_counter());
+        }
+    }
+    for (uint32_t i = 0; i < pass_ncolor; i++) {
+        if (ca[i].imageView && ca[i].imageLayout == VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT && st.rt.color[i]) {
+            pass_fb_record((TexBackend *)st.rt.color[i]->backend);
+            pass_fb_pipe_bits |= 1u;
+        }
+    }
+    if (((has_d && da.imageLayout == VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT) ||
+         (has_s && sa.imageLayout == VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT)) &&
+        st.rt.depth) {
+        pass_fb_record((TexBackend *)st.rt.depth->backend);
+        pass_fb_pipe_bits |= 2u;
+    }
+    if (n_pass_fb) {
+        VkImageMemoryBarrier2 bars[8];
+        int nb = 0;
+        for (int i = 0; i < n_pass_fb; i++) {
+            if (!pass_fb_backs[i].image) continue;
+            bars[nb++] = (VkImageMemoryBarrier2){
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                .srcStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT,
+                .image = pass_fb_backs[i].image,
+                .subresourceRange = {pass_fb_backs[i].aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS},
+            };
+        }
+        if (nb) {
+            VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                   .imageMemoryBarrierCount = (uint32_t)nb, .pImageMemoryBarriers = bars};
+            vkCmdPipelineBarrier2(cb, &di);
         }
     }
     vk_begin_rendering(cb, &ri, pass_color, pass_depth != VK_FORMAT_UNDEFINED ? pass_depth : pass_stencil,
@@ -2900,6 +3029,9 @@ static VkPipeline clear_pipeline(int index, int kind, uint32_t mask, bool depth,
 
 static void clear(int index, int kind, const void *color, uint32_t mask, bool depth, float dval, bool stencil, uint32_t sval,
                   uint32_t smask) {
+    if (in_pass && pass_fb_pipe_bits) st.rt_dirty = true;
+    ninplace = 0;
+    nfeedback = 0;
     begin_pass();
     for (int i = 0; i < nlclear; i++) {  // (done by the pass's load operations: begin_pass - each once)
         if (lclear[i].rec != g_cur_rec) continue;
@@ -3539,6 +3671,7 @@ typedef struct {
     uint8_t blend[8][8];
     uint8_t blend_on, a2c, topo_class, poly_fill, depth_clamp;
     uint8_t prim_restart;  // (no extended dynamic state 2 only: primitive restart is pipeline state then)
+    uint8_t fb_loop;       // bit 0: color feedback layout, bit 1: depth/stencil feedback layout
     uint32_t write_mask[8];
     PipeFx fx;
 } PipeKey;
@@ -3571,7 +3704,7 @@ static int pipe_keep(void) {
             keep = atoi(e);
         } else if (g_vk.props.vendorID == 0x5143 && !vk_low_ram()) {
             keep = 0;
-        } else if (!vk_conserve_ram()) {
+        } else if (!vk_low_ram()) {
             long total_kb = 0;
             FILE *f = fopen("/proc/meminfo", "r");
             if (f) {
@@ -3579,8 +3712,6 @@ static int pipe_keep(void) {
                 fclose(f);
             }
             keep = (total_kb >= 7L * 1024 * 1024) ? 4096 : 1500;
-        } else if (g_vk.props.vendorID == 0x13B5 && !vk_low_ram()) {
-            keep = 1200;
         } else {
             keep = 800;
         }
@@ -3604,10 +3735,10 @@ static void pipe_evict(void) {
     uint64_t done = vk_completed_seq();
     int target = keep * 4 / 5, gone = 0;
     // oldest first: two passes, shorter windows when conserving RAM
-    const bool conserve = vk_conserve_ram();
+    const bool low = vk_low_ram();
     const uint64_t ages[2] = {
-        conserve ? 90000000000ull : 600000000000ull,
-        conserve ? 30000000000ull : 180000000000ull,
+        low ? 90000000000ull : 600000000000ull,
+        low ? 30000000000ull : 180000000000ull,
     };
     for (int pass = 0; pass < 2 && live > target; pass++) {
         uint64_t age = ages[pass];
@@ -3722,6 +3853,10 @@ static void build_pipeline(void *arg) {
         VkRenderPass crp = vk_rp_compat(k->ncolor, k->color, k->depth, k->stencil, ms.rasterizationSamples);
         if (crp) pi.pNext = ri.pNext, pi.renderPass = crp;
     }
+    if (g_vk.feedback_loop) {
+        if (k->fb_loop & 1u) pi.flags |= VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+        if (k->fb_loop & 2u) pi.flags |= VK_PIPELINE_CREATE_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+    }
 #ifdef __ANDROID__
     if (g_vk.exec_stats) pi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     {   // LARECOMP_LOG_PIPE=1: each pipeline's shaders before the driver compiles them (a crash in its compiler: the
@@ -3780,10 +3915,6 @@ static void build_pipeline(void *arg) {
 static NvnTexture *feedback_tex[4];
 static VkImageView feedback_view[4];
 static TexBackend *feedback_snap[4];  // (the snapshot copy itself: array views of it are made at binding)
-static int nfeedback;
-static NvnTexture *inplace_tex[4];  // (targets this draw samples in place while writing them: resolve_feedback)
-static int ninplace;
-static int g_inplace_copy = -1;  // (those targets copied instead; -1: not decided yet this boot - vk_exec_reset)
 static uint64_t g_cur_fs_hash;
 static NvnTexture *snap_tex[8];
 static bool snap_ok[8];
@@ -4168,6 +4299,7 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
     }
     uint32_t written = draw_written | (in_pass && !st.rt_dirty ? pass_written : 0);
     bool any_attachment = false;
+    bool fb_copy_prepared = false;
     ShaderInfo *infos[2] = {pr->vi, pr->fi};
     for (int sg = 0; sg < 2; sg++)
         for (int i = 0; i < infos[sg]->ntex; i++) {
@@ -4205,17 +4337,27 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
                 if (g_inplace_copy < 0) {
                     extern bool vk_driver_is_turnip(void);
                     extern bool vk_turnip_path_on(int setting);
-                    bool inplace = getenv("LARECOMP_FEEDBACK_INPLACE") || (vk_driver_is_turnip() && vk_turnip_path_on(g_settings.inplace_reads));
+#ifdef __ANDROID__
+                    int inplace_setting = g_settings.inplace_reads;
+#else
+                    int inplace_setting = -1;
+#endif
+                    bool fb_ext = g_vk.feedback_loop && inplace_setting != 0 && !getenv("LARECOMP_FEEDBACK_COPY");
+                    bool inplace = getenv("LARECOMP_FEEDBACK_INPLACE") || fb_ext ||
+                                   (vk_driver_is_turnip() && vk_turnip_path_on(inplace_setting));
                     g_inplace_copy = getenv("LARECOMP_FEEDBACK_COPY") != NULL || !inplace;
                     LOG("[vk] targets a draw writes, sampled by it: %s (%s)\n", g_inplace_copy ? "copies" : "in place",
-                        g_settings.inplace_reads < 0 ? "automatic" : "settings");
+                        fb_ext && !g_inplace_copy ? "feedback-loop ext" :
+                        inplace_setting < 0 ? "automatic" : "settings");
                 }
                 extern int vk_ab(const char *what);
                 if (!g_inplace_copy && bit && bit < 1u << 8 && AB("copy") != 1) {
                     int si = -1;
                     for (int k = 0; k < 8; k++) if (snap_tex[k] == t) si = k;
-                    if (si < 0 || !snap_ok[si]) {
-                        if (in_pass && !st.rt_dirty && (pass_written & bit)) st.rt_dirty = true, stat_inplace_breaks++, prof_dirty[0]++;
+                    bool need_layout = g_vk.feedback_loop && in_pass && !tex_in_pass_fb((const TexBackend *)t->backend);
+                    if (si < 0 || !snap_ok[si] || need_layout) {
+                        if (in_pass && !st.rt_dirty && ((pass_written & bit) || need_layout))
+                            st.rt_dirty = true, stat_inplace_breaks++, prof_dirty[0]++;
                         if (si < 0) { static int rr; si = rr++ & 7; snap_tex[si] = t; }
                         snap_ok[si] = true;
                         snap_fb_dirty[si] = false;
@@ -4245,10 +4387,17 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
             }
             stat_feedback_copies++;
             if (ct_on()) LOG("[ct] snapshot %p %ux%u (was %s, si %d)\n", (void *)t, src->width, src->height, si >= 0 ? snap_why[si] : "new", si);
-            vk_end_pass();
+            if (!fb_copy_prepared) {
+                fb_copy_prepared = true;
+                if (in_pass && !st.rt_dirty) prof_dirty[1]++;
+                vk_end_pass();
+                VkCommandBuffer pcb = vk_cmd();
+                if (vk_narrow_pass_barrier_on() && !g_pass_wrote_non_rt && !naliases) vk_pass_barrier_fragment(pcb);
+                else vk_full_barrier(pcb);
+                g_pass_wrote_non_rt = false;
+            }
             TexBackend *dst = snapshot_image(t, src);
             VkCommandBuffer cb = vk_cmd();
-            vk_full_barrier(cb);
             gp_mark(cb, "feedback snapshot %ux%u fmt %d", src->width, src->height, src->format);
             for (uint32_t lv = 0; lv < dst->levels; lv++) {
                 uint32_t w = src->width >> lv, h = src->height >> lv;
@@ -4271,7 +4420,6 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
             if (si < 0) { static int rr; si = rr++ & 7; snap_tex[si] = t; }
             snap_ok[si] = true;
             snap_fb_dirty[si] = false;
-            if (in_pass && !st.rt_dirty) prof_dirty[1]++;
             st.rt_dirty = true;
         }
     if (!any_attachment && !always && !g_debug_frame && !naliases) {
@@ -6100,7 +6248,7 @@ static uint64_t vc_budget(void) {
             if (fscanf(f, "MemTotal: %ld kB", &total_kb) != 1) total_kb = 0;
             fclose(f);
         }
-        b = vk_conserve_ram() ? 256ull << 20 : 768ull << 20;
+        b = vk_conserve_ram() ? (vk_low_ram() ? 256ull << 20 : 512ull << 20) : 768ull << 20;
         if (vk_low_ram() && total_kb && (uint64_t)total_kb * 1024 / 12 < b)
             b = (uint64_t)total_kb * 1024 / 12;
         if (e && atol(e) > 0) b = (uint64_t)atol(e) << 20;
@@ -6383,6 +6531,10 @@ void vk_exec_reset(void) {
     }
     gmem_size = gmem_tried = 0;
     g_inplace_copy = -1;  // (the next boot reads the setting again: resolve_feedback)
+    n_pass_fb = 0;
+    pass_fb_pipe_bits = 0;
+    ninplace = 0;
+    nfeedback = 0;
 #ifdef __ANDROID__
     gcopy_mode = !g_vk.host_import && !getenv("LARECOMP_VK_NO_GCOPY");  // (until the next heap is placed: vk_heap_place)
     gres_reset();  // (the arena's resident ranges: keyed by the old heap's addresses)
@@ -6425,7 +6577,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     static TexFullMemo full_memo[4096];
     uint8_t mflags = (uint8_t)st_->type | (st_->shadow ? 0x40u : 0u) | (stage == 0 ? 0x80u : 0u);
     uint32_t fslot = (uint32_t)(((h * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)mflags * 0xC2B2AE3D27D4EB4Full)) >> 32) & 4095u;
-    bool can_full_memo = !nomemo && !naliases && !nfeedback && !scene_up.t && h && st.tpool && st.spool;
+    bool can_full_memo = !nomemo && !naliases && !nfeedback && !n_pass_fb && !scene_up.t && h && st.tpool && st.spool;
     if (can_full_memo) {
         TexFullMemo *fm = &full_memo[fslot];
         if (fm->handle == h && fm->frame == frame && fm->tpool == st.tpool && fm->spool == st.spool &&
@@ -6519,7 +6671,14 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     }
     if (!view) view = vk_dummy_view(st_->type);
     if (!smp) smp = vk_default_sampler(true);
-    *out = (VkDescriptorImageInfo){smp, view, VK_IMAGE_LAYOUT_GENERAL};
+    VkImageLayout img_layout = VK_IMAGE_LAYOUT_GENERAL;
+    if (n_pass_fb && h && st.tpool && tic < (uint32_t)st.tpool->count) {
+        NvnTexEntry *te_fb = &((NvnTexEntry *)st.tpool->entries)[tic];
+        NvnTexture *t_fb = te_fb->tex ? (naliases ? alias_read(te_fb->tex) : te_fb->tex) : NULL;
+        if (t_fb && tex_in_pass_fb((const TexBackend *)t_fb->backend))
+            img_layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+    }
+    *out = (VkDescriptorImageInfo){smp, view, img_layout};
     if (can_full_memo) {
         TexFullMemo *fm = &full_memo[fslot];
         fm->tpool = st.tpool; fm->spool = st.spool;
@@ -6610,7 +6769,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     if (rscale_row0) memcpy(rs0_cur, rscale_row0, 16);
     if (tint) memcpy(tint_cur, tint, 32);
     bool can_fast = !fast_off && !set_cache_off && stage < 2 && !bindless && !si->uses_gmem_map &&
-                    !up_fix.sx && !ui_pass_vs && !naliases && !nfeedback && !scene_up.t &&
+                    !up_fix.sx && !ui_pass_vs && !naliases && !nfeedback && !n_pass_fb && !scene_up.t &&
                     (stage == 0 || (pre_ii && fii_memo_active_id));
     uint32_t fbucket = can_fast ? fast_bucket_idx(si, layout, stage) : 0;
     if (can_fast) {
@@ -7675,14 +7834,16 @@ static void draw_(CmdRec *r, bool indexed) {
 #ifdef __ANDROID__
     uint32_t fpep = mru_epoch;
     uint64_t pver = pipe_state_ver;
-    typedef struct { Prog *prog; PipeFx fx; uint64_t ver; uint32_t epoch; uint8_t cls, pre_key; Pipe *pp; } FastPipeMru;
+    uint8_t fb_loop_key = g_vk.feedback_loop ? pass_fb_pipe_bits : 0;
+    typedef struct { Prog *prog; PipeFx fx; uint64_t ver; uint32_t epoch; uint8_t cls, pre_key, fb_loop; Pipe *pp; } FastPipeMru;
     static FastPipeMru fast_mru[4];
     Pipe *pp = NULL;
     bool hit = false;
     if (reuse) {
         for (int i = 0; i < 4; i++) {
             if (fast_mru[i].pp && fast_mru[i].epoch == fpep && fast_mru[i].ver == pver && fast_mru[i].prog == pr &&
-                fast_mru[i].cls == cls && fast_mru[i].pre_key == pre_key && !fast_mru[i].pp->evicted &&
+                fast_mru[i].cls == cls && fast_mru[i].pre_key == pre_key && fast_mru[i].fb_loop == fb_loop_key &&
+                !fast_mru[i].pp->evicted &&
                 (g_vk.eds || !memcmp(&fast_mru[i].fx, &fx, sizeof fx))) {
                 pp = fast_mru[i].pp;
                 hit = true;
@@ -7697,8 +7858,10 @@ static void draw_(CmdRec *r, bool indexed) {
         }
     }
 #else
+    uint8_t fb_loop_key = g_vk.feedback_loop ? pass_fb_pipe_bits : 0;
     bool hit = reuse && !pipeline_dirty && last_pipeline &&
                last_pipeline->k.prog == pr && last_pipeline->k.topo_class == cls && last_pipeline->k.prim_restart == pre_key &&
+               last_pipeline->k.fb_loop == fb_loop_key &&
                (g_vk.eds || !memcmp(&last_pipeline->k.fx, &fx, sizeof fx));
     Pipe *pp = hit ? last_pipeline : NULL;
 #endif
@@ -7707,6 +7870,7 @@ static void draw_(CmdRec *r, bool indexed) {
         memset(&k, 0, sizeof k);
         k.prog = pr;
         k.prim_restart = pre_key;
+        k.fb_loop = fb_loop_key;
         k.fx = fx;
         k.ncolor = pass_ncolor;
         memcpy(k.color, pass_color, sizeof k.color);
@@ -7811,7 +7975,7 @@ static void draw_(CmdRec *r, bool indexed) {
 #ifdef __ANDROID__
         if (!hit && reuse) {
             for (int j = 3; j > 0; j--) fast_mru[j] = fast_mru[j - 1];
-            fast_mru[0] = (FastPipeMru){.prog = pr, .fx = fx, .ver = pver, .epoch = fpep, .cls = cls, .pre_key = pre_key, .pp = pp};
+            fast_mru[0] = (FastPipeMru){.prog = pr, .fx = fx, .ver = pver, .epoch = fpep, .cls = cls, .pre_key = pre_key, .fb_loop = fb_loop_key, .pp = pp};
         }
 #endif
         last_pipeline = pp;
@@ -7882,25 +8046,24 @@ static void draw_(CmdRec *r, bool indexed) {
     // fragment textures are bound before deciding the viewport (tex_sc / tex_wh), rscale depends on the decision:
     // build the vertex set now and the fragment set after the decision (stage_set fills tex_sc for stage 1).
     if (prof) prof_dyn += SDL_GetTicksNS() - prof_td_;
-    PROF_T0();
 #ifdef __ANDROID__
-    if ((gcopy_mode || gwin_mode) && (pr->vi->uses_gmem_map || pr->fi->uses_gmem_map)) {  // (the table both stages' sets use)
-        static int snap = -1;  // (LARECOMP_NO_GSNAP=1: through gcopy/gwin as before)
-        if (snap < 0) snap = getenv("LARECOMP_NO_GSNAP") == NULL;
-        bool snapped = snap && pr->vi->uses_gmem_map && !pr->fi->uses_gmem_map && !pr->vi->uses_gmem_store && gsnap_prepare();
-        if (!snapped) {
-            uint32_t mask = (pr->vi->uses_gmem_map ? 1u : 0u) | (pr->fi->uses_gmem_map ? 2u : 0u);
-            if (gcopy_mode)
-                gcopy_prepare(mask, pr->vi->uses_gmem_store || pr->fi->uses_gmem_store);
-            else
-                gwin_prepare(mask);
+    {
+        PROF_T0();
+        if ((gcopy_mode || gwin_mode) && (pr->vi->uses_gmem_map || pr->fi->uses_gmem_map)) {  // (the table both stages' sets use)
+            static int snap = -1;  // (LARECOMP_NO_GSNAP=1: through gcopy/gwin as before)
+            if (snap < 0) snap = getenv("LARECOMP_NO_GSNAP") == NULL;
+            bool snapped = snap && pr->vi->uses_gmem_map && !pr->fi->uses_gmem_map && !pr->vi->uses_gmem_store && gsnap_prepare();
+            if (!snapped) {
+                uint32_t mask = (pr->vi->uses_gmem_map ? 1u : 0u) | (pr->fi->uses_gmem_map ? 2u : 0u);
+                if (gcopy_mode)
+                    gcopy_prepare(mask, pr->vi->uses_gmem_store || pr->fi->uses_gmem_store);
+                else
+                    gwin_prepare(mask);
+            }
         }
+        PROF_ADD(prof_sets);
     }
 #endif
-    uint32_t dyn[64], ndv = 0, ndf = 0;  // (the sets' dynamic uniform buffer offsets: vertex, then fragment)
-    cbw_clear();  // (cbwin_bind fills them while the sets are written)
-    VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndv);
-    PROF_ADD(prof_sets);
     VkDescriptorImageInfo fii[64];
     uint64_t prof_tx_ = prof ? SDL_GetTicksNS() : 0;
 #ifdef __ANDROID__
@@ -7918,7 +8081,7 @@ static void draw_(CmdRec *r, bool indexed) {
     static uint64_t next_fii_stamp = 1;
     fii_memo_active_id = 0;
     uint64_t fii_frame = vk_frame_counter();
-    bool can_fii_memo = !pr->fi_bindless && !nfeedback && !naliases && !scene_up.t && pr->fi->ntex <= 64;
+    bool can_fii_memo = !pr->fi_bindless && !nfeedback && !n_pass_fb && !naliases && !scene_up.t && pr->fi->ntex <= 64;
     if (can_fii_memo && pr->fi->ntex == 0) {
         fii_memo_active_id = 1;
     } else if (can_fii_memo) {
@@ -7967,12 +8130,14 @@ static void draw_(CmdRec *r, bool indexed) {
             up_fix.gw = st.rt.color[0]->width, up_fix.gh = st.rt.color[0]->height;
             up_fix.sx = (float)gb->width / (float)gt->width, up_fix.sy = (float)gb->height / (float)gt->height;
             up_fix.tw = gt->width, up_fix.th = gt->height, up_fix.aw = gb->width, up_fix.ah = gb->height;
-            ndv = 0;  // (the vertex set again, with its constants patched)
-            cbw_clear();
-            vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndv);
         }
     }
     if (prof) prof_tex += SDL_GetTicksNS() - prof_tx_;
+    uint32_t dyn[64], ndv = 0, ndf = 0;  // (the sets' dynamic uniform buffer offsets: vertex, then fragment)
+    cbw_clear();  // (cbwin_bind fills them while the sets are written)
+    PROF_T0();
+    VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndv);
+    PROF_ADD(prof_sets);
     if (fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
         // Draws into the swapchain image (see renderer.m): composites fill the window, UI goes in a centred 16:9 box.
         bool reads_scene = false;
