@@ -1482,8 +1482,49 @@ static VkSpan gmap_copy(void) {
 #endif
 
 #ifdef __ANDROID__
-static bool g_last_fast_ok;
-static uint32_t g_last_fast_bucket;
+typedef struct {
+    uint64_t epoch;
+    VkBuffer buf;
+    VkSpan span;
+    float mir_w, rs0[4], sc[64][2];
+    int ntex;
+} RscaleEnt;
+static RscaleEnt rscale_tab[2][4];
+static uint8_t rscale_rr[2];
+
+static VkSpan rscale_copy(int sg, int ntex, const float *rscale_row0, float mir_w, const float (*sc)[2]) {
+    if (ntex < 0) ntex = 0;
+    if (ntex > 64) ntex = 64;
+    float rs0[4] = {1, 1, 0, 0};
+    if (rscale_row0) memcpy(rs0, rscale_row0, 16);
+    VkBuffer abuf = active >= 0 ? chunks[active].buf : VK_NULL_HANDLE;
+    RscaleEnt *ents = rscale_tab[sg & 1];
+    if (abuf) {
+        for (int i = 0; i < 4; i++) {
+            RscaleEnt *e = &ents[i];
+            if (e->epoch == chunk_epoch && e->buf == abuf && e->ntex == ntex && e->mir_w == mir_w &&
+                !memcmp(e->rs0, rs0, 16) && (!ntex || !memcmp(e->sc, sc, (size_t)ntex * sizeof sc[0])))
+                return e->span;
+        }
+    }
+    float rs[66][4];
+    memset(rs, 0, sizeof rs);
+    memcpy(rs[0], rs0, 16);
+    rs[65][0] = mir_w;
+    for (int t = 0; t < ntex; t++) { rs[1 + t][0] = sc[t][0]; rs[1 + t][1] = sc[t][1]; }
+    VkSpan sp = vk_transient_copy(rs, sizeof rs, 256);
+    int slot = rscale_rr[sg & 1];
+    rscale_rr[sg & 1] = (uint8_t)((slot + 1) & 3);
+    RscaleEnt *dst = &ents[slot];
+    dst->epoch = chunk_epoch;
+    dst->buf = sp.buf;
+    dst->span = sp;
+    dst->mir_w = mir_w;
+    dst->ntex = ntex;
+    memcpy(dst->rs0, rs0, 16);
+    if (ntex) memcpy(dst->sc, sc, (size_t)ntex * sizeof sc[0]);
+    return sp;
+}
 #endif
 
 static inline void bind_state_slots(void *slot_base, size_t elem_size, uint64_t limit,
@@ -2583,16 +2624,30 @@ static void begin_pass(void) {
         extern bool vk_async_on(void);
         static long chunk = -1;
         if (chunk < 0) {
-            // Restore pass-boundary chunking on Mali (6 ms) so CPU recording and GPU execution overlap instead of
-            // serializing the entire frame before present, while split_long_pass stays 0 to preserve TBDR tile passes.
+            // Chunk at pass boundaries on Mali (10 ms + >=800 draws) so G-buffer + setup overlap GPU execution
+            // without flushing 0-draw clear/setup passes or thrashing vcache 6-15x per frame.
             extern bool vk_driver_is_qualcomm(void);
             const char *e = getenv("LARECOMP_VK_CHUNK_US");
-            chunk = e ? atol(e) : vk_driver_is_qualcomm() ? 0 : g_vk.props.vendorID == 0x13B5 ? 6000 : 2000;
+            chunk = e ? atol(e) : vk_driver_is_qualcomm() ? 0 : g_vk.props.vendorID == 0x13B5 ? 10000 : 2000;
         }
         extern int vk_ab(const char *what);
         long ch = chunk > 0 && AB("chunk") == 1 ? 500 : chunk;
-        if (ch > 0 && vk_async_on() && last_submit_ns && SDL_GetTicksNS() - last_submit_ns > (uint64_t)ch * 1000 && !no_chunks_now()) {
+        static uint64_t prev_submit_ns, sub_start_ns, sub_start_draws;
+        if (last_submit_ns != prev_submit_ns) {
+            prev_submit_ns = last_submit_ns;
+            sub_start_draws = stat_draws;
+            sub_start_ns = 0;
+        }
+        if (stat_draws < sub_start_draws) sub_start_draws = 0;
+        uint64_t cur_sub_draws = stat_draws - sub_start_draws;
+        uint64_t now_ns = (ch > 0 && vk_async_on() && last_submit_ns) ? SDL_GetTicksNS() : 0;
+        if (now_ns && (!sub_start_ns || (ch >= 2000 && !cur_sub_draws))) sub_start_ns = now_ns;
+        uint64_t min_draws = ch < 2000 ? 0 : 800;
+        if (now_ns && sub_start_ns && cur_sub_draws >= min_draws && now_ns - sub_start_ns > (uint64_t)ch * 1000 && !no_chunks_now()) {
             renderer_submit();
+            prev_submit_ns = last_submit_ns;
+            sub_start_draws = stat_draws;
+            sub_start_ns = 0;
         }
     }
 #endif
@@ -6786,13 +6841,15 @@ static uint64_t fii_memo_active_id;  // non-zero when draw_() reused or recorded
 static bool is_ubo(VkDescriptorType t) { return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; }
 
 #ifdef __ANDROID__
+static const float (*fii_memo_sc)[2];
+static const uint32_t (*fii_memo_wh)[2];
 #define STAGE_FAST_BUCKETS 128
 typedef struct {
     ShaderInfo *si;
     VkDescriptorSetLayout layout;
     VkDescriptorSet ds;
     VkBuffer gmem_buf;
-    uint64_t ubuf_ver, sbuf_ver, tex_ver, img_ver, pool_ver, ubo_data_ver, exec_seq, epoch, gcopy_gen, frame;
+    uint64_t ubuf_ver, sbuf_ver, tex_ver, img_ver, pool_ver, ubo_data_ver, exec_seq, epoch, gcopy_gen, gpu_copy_ver, frame;
     uint64_t fii_stamp;
     uint32_t rgen, vgen, sgen, bank_epoch, ndyn, dyn[24];
     float rs0[4], tint[8], mirror_w;
@@ -6820,9 +6877,9 @@ static inline void fast_tab_insert(StageSetFast *way, ShaderInfo *si, VkDescript
         .si = si, .layout = layout, .ds = ds, .gmem_buf = gmem_buf,
         .ubuf_ver = st_ubuf_ver[stage], .sbuf_ver = st_sbuf_ver[stage],
         .tex_ver = st_tex_ver[stage], .img_ver = st_img_ver[stage],
-        .pool_ver = st_pool_ver, .ubo_data_ver = st_stage_ubo_data_ver[stage],
+        .pool_ver = st_pool_ver, .ubo_data_ver = st_ubo_data_ver,
         .exec_seq = g_exec_list_seq, .epoch = chunk_epoch,
-        .gcopy_gen = gcopy_gen, .frame = cur_frame,
+        .gcopy_gen = gcopy_gen, .gpu_copy_ver = g_gpu_copy_ver, .frame = cur_frame,
         .fii_stamp = fii_stamp,
         .rgen = rgen, .vgen = vgen, .sgen = sgen,
         .bank_epoch = bank_epoch, .ndyn = ndyn, .mirror_w = g_mirror_w,
@@ -6831,6 +6888,57 @@ static inline void fast_tab_insert(StageSetFast *way, ShaderInfo *si, VkDescript
     if (ndyn) memcpy(way[0].dyn, dyn, ndyn * sizeof dyn[0]);
     memcpy(way[0].rs0, rs0, sizeof way[0].rs0);
     memcpy(way[0].tint, tint, sizeof way[0].tint);
+}
+
+typedef struct {
+    ShaderInfo *si;
+    VkDescriptorSetLayout layout;
+    VkDescriptorSet ds;
+    VkBuffer gmem_buf;
+    uint64_t exec_seq, epoch, gcopy_gen, gpu_copy_ver, frame, ubo_data_ver, pool_ver, sbuf_ver, img_ver, tex_ver, fii_stamp, k1_addr;
+    uint32_t rgen, vgen, sgen, bank_epoch, cbuf_mask;
+    float mir_w;
+    uint8_t set, ndyn, ncb;
+    int8_t bank;
+    uint32_t dyn[16];
+    float rs0[4], tint[8];
+    Range cb[8];
+} StageFast2;
+static StageFast2 fast2_tab[2][512][2];
+
+static inline uint32_t fast2_bucket(const ShaderInfo *si, VkDescriptorSetLayout layout, int stage,
+                                    const Range *cb, int ncb, uint64_t k1_addr, uint64_t extra) {
+    uint64_t h = (uintptr_t)si * 0x9E3779B97F4A7C15ull ^ (uintptr_t)layout * 0xBF58476D1CE4E5B9ull ^
+                 ((uint64_t)stage << 40) ^ k1_addr * 0x517CC1B727220A95ull ^ extra * 0x94D049BB133111EBull;
+    for (int i = 0; i < ncb; i++) {
+        h ^= cb[i].addr * 0x9E3779B97F4A7C15ull ^ (cb[i].size * 0x517CC1B727220A95ull);
+        h = (h ^ (h >> 29)) * 0x94D049BB133111EBull;
+    }
+    return (uint32_t)(h ^ (h >> 18) ^ (h >> 36)) & 511u;
+}
+
+static inline void fast2_tab_insert(StageFast2 *way, ShaderInfo *si, VkDescriptorSetLayout layout,
+                                    VkDescriptorSet ds, int stage, uint32_t set, int8_t bank, uint32_t bank_epoch,
+                                    uint64_t fii_stamp, uint64_t k1_addr, uint64_t cur_frame, uint32_t rgen,
+                                    uint32_t vgen, uint32_t sgen, uint32_t umask, const Range *cb, int ncb,
+                                    const float rs0[4], const float tint[8], const uint32_t *dyn, uint32_t ndyn) {
+    way[1] = way[0];
+    way[0] = (StageFast2){
+        .si = si, .layout = layout, .ds = ds, .gmem_buf = gmem_buf,
+        .exec_seq = g_exec_list_seq, .epoch = chunk_epoch, .gcopy_gen = gcopy_gen,
+        .gpu_copy_ver = g_gpu_copy_ver, .frame = cur_frame, .ubo_data_ver = st_ubo_data_ver,
+        .pool_ver = st_pool_ver, .sbuf_ver = st_sbuf_ver[stage], .img_ver = st_img_ver[stage],
+        .tex_ver = st_tex_ver[0], .fii_stamp = fii_stamp, .k1_addr = k1_addr,
+        .rgen = rgen, .vgen = vgen, .sgen = sgen, .bank_epoch = bank_epoch,
+        .cbuf_mask = umask, .mir_w = g_mirror_w, .set = (uint8_t)set, .ndyn = (uint8_t)ndyn,
+        .ncb = (uint8_t)ncb, .bank = bank,
+    };
+    if (ndyn && dyn) memcpy(way[0].dyn, dyn, ndyn * sizeof dyn[0]);
+    if (stage == 1) {
+        memcpy(way[0].rs0, rs0, sizeof way[0].rs0);
+        memcpy(way[0].tint, tint, sizeof way[0].tint);
+    }
+    if (ncb) memcpy(way[0].cb, cb, (size_t)ncb * sizeof cb[0]);
 }
 #endif
 
@@ -6860,8 +6968,6 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         if (rt0 && vk_texture_scale_group(rt0) == RS_OUT) can_fast = false;
     }
     uint32_t fbucket = can_fast ? fast_bucket_idx(si, layout, stage) : 0;
-    g_last_fast_ok = can_fast;
-    g_last_fast_bucket = fbucket;
     if (can_fast) {
         StageSetFast *way = fast_tab[stage][fbucket];
         for (int i = 0; i < 2; i++) {
@@ -6871,13 +6977,14 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 f->rgen == desc_res_gen && f->vgen == vk_view_gen && f->sgen == tex_slot_gen &&
                 f->ubuf_ver == st_ubuf_ver[stage] && f->sbuf_ver == st_sbuf_ver[stage] &&
                 f->tex_ver == st_tex_ver[stage] && f->img_ver == st_img_ver[stage] &&
-                f->pool_ver == st_pool_ver && f->ubo_data_ver == st_stage_ubo_data_ver[stage] &&
+                f->pool_ver == st_pool_ver && f->ubo_data_ver == st_ubo_data_ver &&
                 f->exec_seq == g_exec_list_seq && f->epoch == chunk_epoch &&
                 f->gcopy_gen == gcopy_gen && f->frame == cur_frame && f->gmem_buf == gmem_buf &&
-                (stage == 0 || (f->fii_stamp == fii_memo_active_id &&
-                                f->mirror_w == g_mirror_w &&
-                                !memcmp(f->rs0, rs0_cur, sizeof rs0_cur) &&
-                                !memcmp(f->tint, tint_cur, sizeof tint_cur)))) {
+                (!si->uses_rscale || f->mirror_w == g_mirror_w) &&
+                (stage == 0 ? (!si->ntex || f->gpu_copy_ver == g_gpu_copy_ver)
+                            : (f->fii_stamp == fii_memo_active_id &&
+                               !memcmp(f->rs0, rs0_cur, sizeof rs0_cur) &&
+                               !memcmp(f->tint, tint_cur, sizeof tint_cur)))) {
                 desc_banks[(int)f->bank].last_seq = pending;
                 if (dyn && f->ndyn) memcpy(dyn, f->dyn, f->ndyn * sizeof f->dyn[0]);
                 if (ndyn) *ndyn = f->ndyn;
@@ -6888,6 +6995,63 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 }
                 prof_set_hits++;
                 return way[0].ds;
+            }
+        }
+    }
+    bool fast2_ready = false;
+    uint32_t umask = 0, bkt2 = 0;
+    uint64_t k1_addr = 0;
+    int ncb = 0;
+    Range cur_cb[8];
+    if (can_fast && !si->cbwin_mask && !g_wide_backdrop) {
+        umask = (si->cbuf_mask >> 3) & 0x3FFFFu;
+        if ((uint32_t)__builtin_popcount(umask) <= 8u) {
+            for (uint32_t m = umask; m;) {
+                int idx = __builtin_ctz(m);
+                m &= m - 1u;
+                cur_cb[ncb++] = st.ubuf[stage][idx];
+            }
+            k1_addr = (si->cbuf_mask & 2u) ? (st.program->stages[stage].code_addr + st.program->stages[stage].const_offset) : 0;
+            uint64_t extra = stage == 1 ? fii_memo_active_id : (si->ntex ? st_tex_ver[0] : 0);
+            bkt2 = fast2_bucket(si, layout, stage, cur_cb, ncb, k1_addr, extra);
+            fast2_ready = true;
+            StageFast2 *way2 = fast2_tab[stage][bkt2];
+            for (int i = 0; i < 2; i++) {
+                StageFast2 *e = &way2[i];
+                if (e->ds && e->si == si && e->layout == layout && e->set == (uint8_t)set &&
+                    e->bank >= 0 && desc_banks[(int)e->bank].epoch == e->bank_epoch &&
+                    e->rgen == desc_res_gen && e->vgen == vk_view_gen && e->sgen == tex_slot_gen &&
+                    e->sbuf_ver == st_sbuf_ver[stage] && e->img_ver == st_img_ver[stage] &&
+                    e->pool_ver == st_pool_ver && e->ubo_data_ver == st_ubo_data_ver &&
+                    e->exec_seq == g_exec_list_seq && e->epoch == chunk_epoch &&
+                    e->gcopy_gen == gcopy_gen && e->frame == cur_frame && e->gmem_buf == gmem_buf &&
+                    e->cbuf_mask == umask && e->ncb == (uint8_t)ncb && e->k1_addr == k1_addr &&
+                    (!si->uses_rscale || e->mir_w == g_mirror_w) &&
+                    (stage == 0 ? (!si->ntex || (e->tex_ver == st_tex_ver[0] && e->gpu_copy_ver == g_gpu_copy_ver))
+                                : (e->fii_stamp == fii_memo_active_id &&
+                                   (!si->uses_rscale || !memcmp(e->rs0, rs0_cur, sizeof rs0_cur)) &&
+                                   (!si->uses_tint || !memcmp(e->tint, tint_cur, sizeof tint_cur))))) {
+                    bool cb_ok = true;
+                    for (int c = 0; c < ncb; c++) {
+                        if (e->cb[c].addr != cur_cb[c].addr || e->cb[c].size != cur_cb[c].size) { cb_ok = false; break; }
+                    }
+                    if (!cb_ok) continue;
+                    desc_banks[(int)e->bank].last_seq = pending;
+                    if (dyn && e->ndyn) memcpy(dyn, e->dyn, e->ndyn * sizeof e->dyn[0]);
+                    if (ndyn) *ndyn = e->ndyn;
+                    if (i == 1) {
+                        StageFast2 tmp = way2[0];
+                        way2[0] = way2[1];
+                        way2[1] = tmp;
+                    }
+                    StageFast2 *hit = &way2[0];
+                    if (hit->ndyn <= 24)
+                        fast_tab_insert(fast_tab[stage][fbucket], si, layout, hit->ds, stage, set, hit->bank,
+                                        hit->bank_epoch, fii_memo_active_id, cur_frame, desc_res_gen, vk_view_gen,
+                                        tex_slot_gen, rs0_cur, tint_cur, hit->dyn, hit->ndyn);
+                    prof_set_hits++;
+                    return hit->ds;
+                }
             }
         }
     }
@@ -6910,9 +7074,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     }
     const DescriptorPlan *plan = &p->descriptor_plans[set];
 #endif
-#ifdef __ANDROID__
-    float rs[66][4];  // (filled when the shader has the table: binding 18 below)
-#else
+#ifndef __ANDROID__
     float rs[66][4] = {{1, 1, 0, 0}};  // ([65]: mirror mode, renderer.m)
     if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
     rs[65][0] = g_mirror_w;
@@ -6936,7 +7098,16 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         if (b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b->binding >= 32) {
             int ti = (int)b->binding - 32;
             float sc[2]; uint32_t wh[2];
-            if (ti < si->ntex && pre_ii && ti < 64) { ii[n] = pre_ii[ti]; sc[0] = tex_sc[sg][ti][0]; sc[1] = tex_sc[sg][ti][1]; wh[0] = tex_wh[sg][ti][0]; wh[1] = tex_wh[sg][ti][1]; }
+            if (ti < si->ntex && pre_ii && ti < 64) {
+                ii[n] = pre_ii[ti];
+#ifdef __ANDROID__
+                const float (*src_sc)[2] = (sg == 1 && fii_memo_sc) ? fii_memo_sc : (const float (*)[2])tex_sc[sg];
+                const uint32_t (*src_wh)[2] = (sg == 1 && fii_memo_wh) ? fii_memo_wh : (const uint32_t (*)[2])tex_wh[sg];
+                sc[0] = src_sc[ti][0]; sc[1] = src_sc[ti][1]; wh[0] = src_wh[ti][0]; wh[1] = src_wh[ti][1];
+#else
+                sc[0] = tex_sc[sg][ti][0]; sc[1] = tex_sc[sg][ti][1]; wh[0] = tex_wh[sg][ti][0]; wh[1] = tex_wh[sg][ti][1];
+#endif
+            }
             else if (ti < si->ntex) texture_info(stage, si, ti, &ii[n], sc, wh);
             else { ii[n] = (VkDescriptorImageInfo){vk_default_sampler(true), vk_dummy_view(TEXTYPE_2D), VK_IMAGE_LAYOUT_GENERAL}; sc[0] = sc[1] = 1; wh[0] = wh[1] = 0; }
             if (ti < 64) {
@@ -7008,13 +7179,12 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
 #endif
         } else if (b->binding == 18) {
 #ifdef __ANDROID__
-            memset(rs, 0, sizeof rs);
-            rs[0][0] = rs[0][1] = 1;  // ([65]: mirror mode, renderer.m)
-            if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
-            rs[65][0] = g_mirror_w;
-#endif
+            const float (*rsc)[2] = (sg == 1 && fii_memo_sc) ? fii_memo_sc : (const float (*)[2])tex_sc[sg];
+            bi[n] = ubo_span(rscale_copy(sg, si->ntex, rscale_row0, g_mirror_w, rsc), sizeof(float[66][4]));
+#else
             for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; }
             bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, sizeof rs, 256), sizeof rs);
+#endif
         } else {
             float zero[8] = {0};
             bi[n] = ubo_span(copy_dedupe(DEDUPE_TINT, tint ? tint : zero, 32, 256), 32);
@@ -7088,6 +7258,11 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                     fast_tab_insert(fast_tab[stage][fbucket], si, layout, ent->ds, stage, set, ent->bank,
                                     ent->epoch, fii_memo_active_id, cur_frame, desc_res_gen, vk_view_gen,
                                     tex_slot_gen, rs0_cur, tint_cur, dyn, nd);
+                if (fast2_ready && dyn && nd <= 16)
+                    fast2_tab_insert(fast2_tab[stage][bkt2], si, layout, ent->ds, stage, set, ent->bank,
+                                     ent->epoch, fii_memo_active_id, k1_addr, cur_frame, desc_res_gen,
+                                     vk_view_gen, tex_slot_gen, umask, cur_cb, ncb, rs0_cur, tint_cur,
+                                     dyn, nd);
                 prof_set_hits++;
                 return ent->ds;
             }
@@ -7122,6 +7297,10 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 fast_tab_insert(fast_tab[stage][fbucket], si, layout, ds, stage, set, (int8_t)bank,
                                 desc_banks[bank].epoch, fii_memo_active_id, cur_frame, desc_res_gen,
                                 vk_view_gen, tex_slot_gen, rs0_cur, tint_cur, dyn, nd);
+            if (fast2_ready && dyn && nd <= 16)
+                fast2_tab_insert(fast2_tab[stage][bkt2], si, layout, ds, stage, set, (int8_t)bank,
+                                 desc_banks[bank].epoch, fii_memo_active_id, k1_addr, cur_frame, desc_res_gen,
+                                 vk_view_gen, tex_slot_gen, umask, cur_cb, ncb, rs0_cur, tint_cur, dyn, nd);
         }
         return ds;
     }
@@ -7340,157 +7519,6 @@ static bool topology(uint32_t mode, VkPrimitiveTopology *t, uint8_t *cls) {
     case 5: *t = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; *cls = 2; return true;
     default: *t = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; *cls = 2; return false;
     }
-}
-
-#ifdef __ANDROID__
-typedef struct {
-    ShaderInfo *si;
-    VkDescriptorSetLayout layout;
-    VkDescriptorSet ds;
-    VkBuffer gmem_buf;
-    uint64_t exec_seq, epoch, gcopy_gen, frame, ubo_data_ver, pool_ver, sbuf_ver, img_ver, tex_ver, fii_stamp;
-    uint32_t rgen, vgen, sgen, bank_epoch, mir_w, cbuf_mask;
-    uint8_t set, ndyn, ncb;
-    int8_t bank;
-    uint32_t dyn[16];
-    float rs0[4], tint[8];
-    Range cb[8];
-} StageFast2;
-static StageFast2 fast2_tab[2][512][4];
-
-static inline uint32_t fast2_bucket(const ShaderInfo *si, VkDescriptorSetLayout layout, int stage,
-                                    const Range *cb, int ncb, uint64_t extra) {
-    uint64_t h = (uintptr_t)si * 0x9E3779B97F4A7C15ull ^ (uintptr_t)layout * 0xBF58476D1CE4E5B9ull ^
-                 ((uint64_t)stage << 40) ^ extra * 0x94D049BB133111EBull;
-    for (int i = 0; i < ncb; i++) {
-        h ^= cb[i].addr * 0x9E3779B97F4A7C15ull ^ (cb[i].size * 0x517CC1B727220A95ull);
-        h = (h ^ (h >> 29)) * 0x94D049BB133111EBull;
-    }
-    return (uint32_t)(h ^ (h >> 18) ^ (h >> 36)) & 511u;
-}
-#endif
-
-static VkDescriptorSet stage_set_cached(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si,
-                                        const float *rscale_row0, const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz,
-                                        const VkDescriptorImageInfo *pre_ii, uint32_t *dyn, uint32_t *ndyn) {
-#ifdef __ANDROID__
-    static int fast2_off = -1, set2_off = -1;
-    if (fast2_off < 0) fast2_off = getenv("LARECOMP_NO_STAGE_FAST") != NULL;
-    if (set2_off < 0) set2_off = getenv("LARECOMP_NO_SET_CACHE") != NULL;
-    bool bindless = stage == 0 ? p->vi_bindless : stage == 1 ? p->fi_bindless : true;
-    bool eligible = !fast2_off && !set2_off && stage < 2 && si && !bindless && !si->uses_gmem_map && !si->cbwin_mask &&
-                    !up_fix.sx && !g_wide_backdrop && !naliases &&
-                    ((stage == 0 && si->ntex == 0) || (!nfeedback && !n_pass_fb && !scene_up.t)) &&
-                    (stage == 0 || (pre_ii && fii_memo_active_id));
-    if (eligible && stage == 0) {
-        NvnTexture *rt0 = st.rt.ncolor ? st.rt.color[0] : NULL;
-        if (rt0 && vk_texture_scale_group(rt0) == RS_OUT) eligible = false;
-    }
-    uint32_t cmask = si ? (si->cbuf_mask & 0x3FFFFu) : 0u;
-    if (!eligible || (uint32_t)__builtin_popcount(cmask) > 8u)
-        return stage_set(p, layout, set, stage, si, rscale_row0, tint, gx, gy, gz, pre_ii, dyn, ndyn);
-    Range cur_cb[8];
-    int ncb = 0;
-    for (uint32_t m = cmask; m;) {
-        int k = __builtin_ctz(m);
-        m &= m - 1u;
-        cur_cb[ncb++] = st.ubuf[stage][k];
-    }
-    float rs0_cur[4] = {1, 1, 0, 0}, tint_cur[8] = {0};
-    if (stage == 1) {
-        if (rscale_row0) memcpy(rs0_cur, rscale_row0, 16);
-        if (tint) memcpy(tint_cur, tint, 32);
-    }
-    uint64_t extra = stage == 1 ? fii_memo_active_id : (si->ntex ? st_tex_ver[0] : 0);
-    uint32_t bkt = fast2_bucket(si, layout, stage, cur_cb, ncb, extra);
-    StageFast2 *way = fast2_tab[stage][bkt];
-    extern uint32_t vk_view_gen, tex_slot_gen;
-    uint64_t pending = vk_pending_seq();
-    uint64_t cur_frame = vk_frame_counter();
-    for (int i = 0; i < 4; i++) {
-        StageFast2 *e = &way[i];
-        if (e->ds && e->si == si && e->layout == layout && e->set == (uint8_t)set &&
-            e->bank >= 0 && desc_banks[(int)e->bank].epoch == e->bank_epoch &&
-            e->rgen == desc_res_gen && e->vgen == vk_view_gen && e->sgen == tex_slot_gen &&
-            e->sbuf_ver == st_sbuf_ver[stage] && e->img_ver == st_img_ver[stage] &&
-            e->pool_ver == st_pool_ver && e->ubo_data_ver == st_stage_ubo_data_ver[stage] &&
-            e->exec_seq == g_exec_list_seq && e->epoch == chunk_epoch &&
-            e->gcopy_gen == gcopy_gen && e->frame == cur_frame && e->gmem_buf == gmem_buf &&
-            e->cbuf_mask == cmask && e->ncb == (uint8_t)ncb &&
-            (stage == 0 ? (!si->ntex || e->tex_ver == st_tex_ver[0])
-                        : (e->fii_stamp == fii_memo_active_id &&
-                           (!si->uses_rscale || (e->mir_w == g_mirror_w && !memcmp(e->rs0, rs0_cur, sizeof rs0_cur))) &&
-                           (!si->uses_tint || !memcmp(e->tint, tint_cur, sizeof tint_cur))))) {
-            bool cb_ok = true;
-            for (int c = 0; c < ncb; c++) {
-                if (e->cb[c].addr != cur_cb[c].addr || e->cb[c].size != cur_cb[c].size) { cb_ok = false; break; }
-            }
-            if (!cb_ok) continue;
-            desc_banks[(int)e->bank].last_seq = pending;
-            if (dyn && e->ndyn) memcpy(dyn, e->dyn, e->ndyn * sizeof e->dyn[0]);
-            if (ndyn) *ndyn = e->ndyn;
-            if (i > 0) {
-                StageFast2 tmp = way[i];
-                way[i] = way[0];
-                way[0] = tmp;
-            }
-            prof_set_hits++;
-            return way[0].ds;
-        }
-    }
-    VkDescriptorSet ds = stage_set(p, layout, set, stage, si, rscale_row0, tint, gx, gy, gz, pre_ii, dyn, ndyn);
-    if (ds && g_last_fast_ok && ndyn && *ndyn <= 16) {
-        StageSetFast *f0 = &fast_tab[stage][g_last_fast_bucket][0];
-        if (f0->ds == ds && f0->si == si && f0->layout == layout && f0->set == (uint8_t)set &&
-            f0->ndyn == (uint8_t)*ndyn && f0->bank >= 0 && desc_banks[(int)f0->bank].epoch == f0->bank_epoch &&
-            (*ndyn == 0 || !dyn || !memcmp(f0->dyn, dyn, *ndyn * sizeof dyn[0]))) {
-            int slot = 3;
-            for (int i = 0; i < 4; i++) {
-                StageFast2 *e = &way[i];
-                if (!e->ds || e->frame != cur_frame || e->exec_seq != g_exec_list_seq || e->epoch != chunk_epoch ||
-                    e->bank < 0 || desc_banks[(int)e->bank].epoch != e->bank_epoch) {
-                    slot = i;
-                    break;
-                }
-            }
-            for (int k = slot; k > 0; k--) way[k] = way[k - 1];
-            StageFast2 *dst = &way[0];
-            dst->si = si;
-            dst->layout = layout;
-            dst->ds = ds;
-            dst->gmem_buf = gmem_buf;
-            dst->exec_seq = g_exec_list_seq;
-            dst->epoch = chunk_epoch;
-            dst->gcopy_gen = gcopy_gen;
-            dst->frame = cur_frame;
-            dst->ubo_data_ver = st_stage_ubo_data_ver[stage];
-            dst->pool_ver = st_pool_ver;
-            dst->sbuf_ver = st_sbuf_ver[stage];
-            dst->img_ver = st_img_ver[stage];
-            dst->tex_ver = st_tex_ver[0];
-            dst->fii_stamp = fii_memo_active_id;
-            dst->rgen = desc_res_gen;
-            dst->vgen = vk_view_gen;
-            dst->sgen = tex_slot_gen;
-            dst->bank_epoch = f0->bank_epoch;
-            dst->mir_w = g_mirror_w;
-            dst->cbuf_mask = cmask;
-            dst->set = (uint8_t)set;
-            dst->ndyn = (uint8_t)*ndyn;
-            dst->ncb = (uint8_t)ncb;
-            dst->bank = f0->bank;
-            if (*ndyn && dyn) memcpy(dst->dyn, dyn, *ndyn * sizeof dyn[0]);
-            if (stage == 1) {
-                memcpy(dst->rs0, rs0_cur, sizeof rs0_cur);
-                memcpy(dst->tint, tint_cur, sizeof tint_cur);
-            }
-            if (ncb) memcpy(dst->cb, cur_cb, (size_t)ncb * sizeof cur_cb[0]);
-        }
-    }
-    return ds;
-#else
-    return stage_set(p, layout, set, stage, si, rscale_row0, tint, gx, gy, gz, pre_ii, dyn, ndyn);
-#endif
 }
 
 static void draw_(CmdRec *r, bool indexed);
@@ -8320,6 +8348,9 @@ static void draw_(CmdRec *r, bool indexed) {
     }
 #endif
     VkDescriptorImageInfo fii[64];
+    const VkDescriptorImageInfo *fii_ptr = fii;
+    const float (*fii_sc)[2] = tex_sc[1];
+    const uint32_t (*fii_wh)[2] = tex_wh[1];
     uint64_t prof_tx_ = prof ? SDL_GetTicksNS() : 0;
 #ifdef __ANDROID__
     typedef struct {
@@ -8346,9 +8377,9 @@ static void draw_(CmdRec *r, bool indexed) {
         if (fm->fi == pr->fi && fm->ntex == pr->fi->ntex && fm->tex_ver == st_tex_ver[1] &&
             fm->pool_ver == st_pool_ver && fm->frame == fii_frame && fm->vgen == vk_view_gen &&
             fm->sgen == tex_slot_gen && fm->gcopy_ver == g_gpu_copy_ver) {
-            memcpy(fii, fm->ii, (size_t)fm->ntex * sizeof fii[0]);
-            memcpy(tex_sc[1], fm->sc, (size_t)fm->ntex * sizeof tex_sc[1][0]);
-            memcpy(tex_wh[1], fm->wh, (size_t)fm->ntex * sizeof tex_wh[1][0]);
+            fii_ptr = fm->ii;
+            fii_sc = fm->sc;
+            fii_wh = fm->wh;
             fii_memo_active_id = fm->stamp;
         } else {
             for (int i = 0; i < pr->fi->ntex; i++) {
@@ -8378,8 +8409,8 @@ static void draw_(CmdRec *r, bool indexed) {
         if (off < 0) off = getenv("LARECOMP_NO_UPSAMPLE_FIX") != NULL;
         bool scaled = !off && st.rt.ncolor && st.rt.color[0] && (pass_sx > 1.001f || pass_sy > 1.001f);
         int gs = scaled ? pr->fs_gather - 2 : -1;
-        NvnTexture *gt = gs >= 0 && fabsf(tex_sc[1][gs][0] - pass_sx) < 0.01f * pass_sx &&
-                         fabsf(tex_sc[1][gs][1] - pass_sy) < 0.01f * pass_sy ? shader_texture_object(1, &pr->fi->tex[gs]) : NULL;
+        NvnTexture *gt = gs >= 0 && fabsf(fii_sc[gs][0] - pass_sx) < 0.01f * pass_sx &&
+                         fabsf(fii_sc[gs][1] - pass_sy) < 0.01f * pass_sy ? shader_texture_object(1, &pr->fi->tex[gs]) : NULL;
         TexBackend *gb = gt ? gt->backend : NULL;
         if (gb && gt->width && gt->height) {
             up_fix.gw = st.rt.color[0]->width, up_fix.gh = st.rt.color[0]->height;
@@ -8391,19 +8422,19 @@ static void draw_(CmdRec *r, bool indexed) {
     uint32_t dyn[64], ndv = 0, ndf = 0;  // (the sets' dynamic uniform buffer offsets: vertex, then fragment)
     cbw_clear();  // (cbwin_bind fills them while the sets are written)
     PROF_T0();
-    VkDescriptorSet vset = stage_set_cached(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndv);
+    VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndv);
     PROF_ADD(prof_sets);
     if (fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
         // Draws into the swapchain image (see renderer.m): composites fill the window, UI goes in a centred 16:9 box.
         bool reads_scene = false;
         for (int i = 0; i < pr->fi->ntex && i < 64; i++)
-            if ((tex_sc[1][i][0] != 1 || tex_sc[1][i][1] != 1) && tex_wh[1][i][0] == st.rt.color[0]->width &&
-                tex_wh[1][i][1] == st.rt.color[0]->height)
+            if ((fii_sc[i][0] != 1 || fii_sc[i][1] != 1) && fii_wh[i][0] == st.rt.color[0]->width &&
+                fii_wh[i][1] == st.rt.color[0]->height)
                 reads_scene = true;
         bool fullscreen_quad = r->x[2] <= 6 && st.viewport[0][0] == 0 && st.viewport[0][1] == 0 &&
                                st.viewport[0][2] >= st.rt.color[0]->width && st.viewport[0][3] >= st.rt.color[0]->height;
         bool fullscreen_fill = pr->fi->ntex == 0 && fullscreen_quad;
-        if (fullscreen_quad && !reads_scene && pr->fi->ntex == 1 && (tex_sc[1][0][0] != 1 || tex_sc[1][0][1] != 1)) reads_scene = true;
+        if (fullscreen_quad && !reads_scene && pr->fi->ntex == 1 && (fii_sc[0][0] != 1 || fii_sc[0][1] != 1)) reads_scene = true;
         static uint64_t wide_frame = ~0ull;
         if (reads_scene) wide_frame = renderer_present_count();
         bool fade_fill = false;
@@ -8440,7 +8471,15 @@ static void draw_(CmdRec *r, bool indexed) {
     apply_scissor();
     float rs0[4] = {vp_sx, vp_sy, vp_ox, vp_oy};
     uint64_t prof_t1_ = prof ? SDL_GetTicksNS() : 0;
-    VkDescriptorSet fset = stage_set_cached(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn + ndv, &ndf);
+#ifdef __ANDROID__
+    fii_memo_sc = fii_sc;
+    fii_memo_wh = fii_wh;
+#endif
+    VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii_ptr, dyn + ndv, &ndf);
+#ifdef __ANDROID__
+    fii_memo_sc = NULL;
+    fii_memo_wh = NULL;
+#endif
     up_fix.sx = 0;
     if (prof) prof_sets += SDL_GetTicksNS() - prof_t1_;
     VkDescriptorSet sets[2] = {vset, fset};

@@ -189,7 +189,7 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
         }
         g_guest_lo = base;
         fprintf(stderr, "[android] guest window %#llx-%#llx\n", (unsigned long long)base, (unsigned long long)(base + hi - lo));
-        fprintf(stderr, "[BOTW-Opt r10] Helio G99 / Mali-G57 Optimization Suite Active\n");
+        fprintf(stderr, "[BOTW-Opt r11] Helio G99 / Mali-G57 Optimization Suite Active\n");
         const char *last = getenv("LARECOMP_LAST_EXIT");  // (the activity: ApplicationExitInfo)
         if (last && *last) fprintf(stderr, "[android] the last run ended: %s\n", last);
         const char *boot = getenv("LARECOMP_BOOT_STATE");
