@@ -549,15 +549,26 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     if (type == VK_IMAGE_TYPE_2D && layers >= 6 && tw == th && samples == 1) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     if (type == VK_IMAGE_TYPE_3D && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))
         flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;  // (its slices rendered to through 2D views: vk_view)
-    {   // Low RAM (exec.c vk_low_ram, or LARECOMP_HALF_TEXTURES=1 / 0): a mipmapped texture the game only samples starts
-        // at its second level - a quarter of the memory. A 4 GB tablet ran out of memory loading the world with 330 MB
-        // of textures on the GPU (Galaxy Tab A9+, 2026-11-08). Not render targets, linear or small ones.
-        static int half = -1;
+    {   // Memory conservation (exec.c vk_low_ram / vk_conserve_ram, or LARECOMP_HALF_TEXTURES=1 / 0): mipmapped block-compressed
+        // sampled textures start at level 1 (a quarter of GPU memory and L2 bandwidth). <4 GB uses >=128x128; 4-8 GB Mali uses >=256x256.
+        static int half = -1, min_dim = 128;
         if (half < 0) {
             extern bool vk_low_ram(void);
+            extern bool vk_conserve_ram(void);
             const char *e = getenv("LARECOMP_HALF_TEXTURES");
-            half = e ? atoi(e) != 0 : vk_low_ram();
-            if (half) LOG("[vk] textures from their second level (half size): low RAM\n");
+            if (e) {
+                half = atoi(e) != 0;
+                min_dim = 128;
+            } else if (vk_low_ram()) {
+                half = 1;
+                min_dim = 128;
+            } else if (vk_conserve_ram() && g_vk.props.vendorID == 0x13B5) {
+                half = 1;
+                min_dim = 256;
+            } else {
+                half = 0;
+            }
+            if (half) LOG("[vk] textures from their second level (>=%dx%d): %s\n", min_dim, min_dim, vk_low_ram() ? "low RAM" : "Mali conservation");
         }
         b->skip = 0;
         // Only block-compressed ones (BC / ASTC: colours, materials, most of the memory): an uncompressed one may be data
@@ -565,7 +576,7 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         // Link missing (Galaxy Tab A9+, 2026-11-13).
         bool compressed = t->layout.fmt && t->layout.fmt->bw > 1;
         if (half && compressed && !depthfmt && b->rs_group == RS_NONE && !(t->flags & (8 | 0x50)) && type == VK_IMAGE_TYPE_2D &&
-            samples == 1 && levels >= 2 && t->layout.levels >= 2 && tw >= 128 && th >= 128) {
+            samples == 1 && levels >= 2 && t->layout.levels >= 2 && tw >= (uint32_t)min_dim && th >= (uint32_t)min_dim) {
             tw >>= 1, th >>= 1, levels--, b->skip = 1;
         }
     }
@@ -828,10 +839,10 @@ static bool tex_periodic(void) {
 static bool tex_discard(void) {
     static int on = -1;
     if (on < 0) {
-        extern bool vk_low_ram(void);
+        extern bool vk_conserve_ram(void);
         const char *e = getenv("LARECOMP_TEX_DISCARD");
-        on = e ? atoi(e) != 0 : vk_low_ram();
-        if (on) LOG("[vk] textures: guest bytes given back after upload (low RAM)\n");
+        on = e ? atoi(e) != 0 : vk_conserve_ram();
+        if (on) LOG("[vk] textures: guest bytes given back after upload (conserving RAM)\n");
     }
     return on;
 }

@@ -987,11 +987,39 @@ void vk_gpuprof_report(void) {
     static uint64_t t[GP_MAX];
     if (vkGetQueryPoolResults(g_vk.dev, gp_qp, 0, (uint32_t)gp_n, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
         double per = g_vk.props.limits.timestampPeriod / 1e6, total = (t[gp_n - 1] - t[0]) * per;
+        double denom = total > 0 ? total : 1.0;
         LOG("[gpuprof] %d marks, %.2f ms first to last (rows: the work after each mark, until the next)\n", gp_n, total);
+        bool sparse = gp_n > 60;
         for (int i = 0; i + 1 < gp_n; i++) {
             double ms = (t[i + 1] - t[i]) * per;
-            LOG("[gpuprof] %6.3f ms %5.1f%%  %s%s", ms, 100 * ms / (total > 0 ? total : 1), gp_label[i], gp_draws[i] ? "" : "\n");
+            if (sparse && ms < 0.05) continue;
+            LOG("[gpuprof] %6.3f ms %5.1f%%  %s%s", ms, 100 * ms / denom, gp_label[i], gp_draws[i] ? "" : "\n");
             if (gp_draws[i]) LOG(", %u draws\n", gp_draws[i]);
+        }
+        int top[15], ntop = 0;
+        for (int i = 0; i + 1 < gp_n; i++) {
+            if (t[i + 1] <= t[i]) continue;
+            uint64_t ticks = t[i + 1] - t[i];
+            int pos;
+            if (ntop < 15) {
+                pos = ntop++;
+            } else {
+                if (ticks <= t[top[14] + 1] - t[top[14]]) continue;
+                pos = 14;
+            }
+            while (pos > 0 && (t[top[pos - 1] + 1] - t[top[pos - 1]]) < ticks) {
+                top[pos] = top[pos - 1];
+                pos--;
+            }
+            top[pos] = i;
+        }
+        if (ntop) {
+            LOG("[gpuprof] top %d passes:\n", ntop);
+            for (int k = 0; k < ntop; k++) {
+                int i = top[k];
+                double ms = (t[i + 1] - t[i]) * per;
+                LOG("[gpuprof]   #%d %6.3f ms (%5.1f%%) %s (%u draws)\n", k + 1, ms, 100 * ms / denom, gp_label[i], gp_draws[i]);
+            }
         }
         LOG("[gpuprof] (last mark: %s)\n", gp_label[gp_n - 1]);
     }
@@ -1146,6 +1174,7 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
 }
 
 #ifdef __ANDROID__
+bool vk_conserve_ram(void);
 #define DESC_BANKS 8
 #define DESC_BANK_MAX_SETS 6144
 typedef struct {
@@ -1159,20 +1188,25 @@ static int cur_desc_bank;
 static uint32_t desc_res_gen = 1;
 
 static VkDescriptorSet persist_alloc_set(VkDescriptorSetLayout layout, int *bank_out) {
-    for (int tries = 0; tries < DESC_BANKS; tries++) {
+    const bool conserve = vk_conserve_ram();
+    const int nbanks = conserve ? 4 : DESC_BANKS;
+    const uint32_t max_sets = conserve ? 3072u : DESC_BANK_MAX_SETS;
+    for (int tries = 0; tries < nbanks; tries++) {
+        if (cur_desc_bank >= nbanks) cur_desc_bank = 0;
         DescBank *b = &desc_banks[cur_desc_bank];
         if (!b->pool) {
+            const uint32_t div = conserve ? 2u : 1u;
             VkDescriptorPoolSize sizes[] = {
-                {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 24576},
-                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
-                {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
-                {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024},
-                {VK_DESCRIPTOR_TYPE_SAMPLER, 1024},
-                {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 24576}
+                {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 24576u / div},
+                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096u / div},
+                {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768u / div},
+                {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024u / div},
+                {VK_DESCRIPTOR_TYPE_SAMPLER, 1024u / div},
+                {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 24576u / div}
             };
             VkDescriptorPoolCreateInfo ci = {
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                .maxSets = DESC_BANK_MAX_SETS,
+                .maxSets = max_sets,
                 .poolSizeCount = 6,
                 .pPoolSizes = sizes
             };
@@ -1181,7 +1215,7 @@ static VkDescriptorSet persist_alloc_set(VkDescriptorSetLayout layout, int *bank
             b->used = 0;
             b->last_seq = 0;
         }
-        if (b->used < DESC_BANK_MAX_SETS) {
+        if (b->used < max_sets) {
             VkDescriptorSetAllocateInfo ai = {
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
                 .descriptorPool = b->pool,
@@ -1195,7 +1229,7 @@ static VkDescriptorSet persist_alloc_set(VkDescriptorSetLayout layout, int *bank
                 return set;
             }
         }
-        int next = (cur_desc_bank + 1) % DESC_BANKS;
+        int next = (cur_desc_bank + 1) % nbanks;
         DescBank *nb = &desc_banks[next];
         if (nb->pool) {
             if (nb->last_seq > submit_seq) { cur_desc_bank = next; continue; }
@@ -1246,8 +1280,35 @@ bool vk_low_ram(void) {
     }
     return low;
 }
-#define CHUNK_SIZE (vk_low_ram() ? 16ull << 20 : 64ull << 20)
-#define RING_KEEP (vk_low_ram() ? 2 : 4)
+bool vk_conserve_ram(void) {
+    static int cons = -1;
+    if (cons < 0) {
+        const char *e = getenv("LARECOMP_CONSERVE_RAM");
+        if (e) {
+            cons = atoi(e) != 0;
+        } else if (vk_low_ram()) {
+            cons = 1;
+        } else {
+            long total_kb = 0, avail_kb = 0;
+            FILE *f = fopen("/proc/meminfo", "r");
+            if (f) {
+                char line[128];
+                while (fgets(line, sizeof line, f)) {
+                    long v = 0;
+                    if (!total_kb && sscanf(line, "MemTotal: %ld kB", &v) == 1) total_kb = v;
+                    else if (!avail_kb && sscanf(line, "MemAvailable: %ld kB", &v) == 1) avail_kb = v;
+                }
+                fclose(f);
+            }
+            cons = (total_kb && total_kb <= 8L * 1024 * 1024) || (avail_kb && avail_kb < 3500L * 1024);
+        }
+        if (cons && !vk_low_ram())
+            LOG("[vk] conserving RAM: tighter upload ring, caches, and texture budgets\n");
+    }
+    return cons;
+}
+#define CHUNK_SIZE (vk_conserve_ram() ? 16ull << 20 : 64ull << 20)
+#define RING_KEEP (vk_conserve_ram() ? 2 : 4)
 typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t size, used, seq, frame; } Chunk;  // frame: last picked
 static Chunk *chunks;
 static int nchunks, active = -1;
@@ -1739,7 +1800,7 @@ const char *renderer_stats(void) {
         extern int vk_texture_count(void);
         size_t n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, ", gpu mem %.0fMB, %d textures", (double)used / 1048576.0, vk_texture_count());
-        if (vk_low_ram()) {  // (their guest bytes: in RAM or swap next to the images, unless discarded - textures.c)
+        if (vk_low_ram() || vk_conserve_ram() || prof) {  // (their guest bytes: in RAM or swap next to the images, unless discarded - textures.c)
             extern uint64_t vk_texture_guest_bytes(uint64_t *discarded);
             uint64_t disc = 0, g = vk_texture_guest_bytes(&disc);
             n = strlen(stats_text);
@@ -1749,7 +1810,7 @@ const char *renderer_stats(void) {
                 extern int vk_live_counts(char *out, int cap);
                 char vk[768] = "";
                 vk_live_counts(vk, sizeof vk);
-                LOG("[vk] low RAM: %s\n", vk);
+                LOG("%s %s\n", vk_low_ram() ? "[vk] low RAM:" : "[vk] mem:", vk);
             }
         }
     }
@@ -1831,12 +1892,14 @@ static uint64_t st_img_ver[6] = {1, 1, 1, 1, 1, 1};
 static uint64_t st_pool_ver = 1;
 static uint64_t st_rt_ver = 1;
 static uint64_t st_ubo_data_ver = 1;
+static uint64_t st_stage_ubo_data_ver[6] = {1, 1, 1, 1, 1, 1};
 static uint64_t g_exec_list_seq = 1;
 static uint64_t g_gpu_copy_ver = 1;
 
 static inline void bump_state_vers(void) {
     for (int i = 0; i < 6; i++) {
         st_ubuf_ver[i]++; st_sbuf_ver[i]++; st_tex_ver[i]++; st_img_ver[i]++;
+        st_stage_ubo_data_ver[i]++;
     }
     st_pool_ver++;
     st_rt_ver++;
@@ -2373,8 +2436,8 @@ static void begin_pass(void) {
             extern bool vk_driver_is_qualcomm(void);
             const char *e = getenv("LARECOMP_VK_CHUNK_US");
             chunk_env = e != NULL;
-            // Overlap Mali TBDR execution with CPU command translation at pass boundaries without splitting passes.
-            chunk = e ? atol(e) : vk_driver_is_qualcomm() ? 0 : g_vk.props.vendorID == 0x13B5 ? 4000 : 2000;
+            // Overlap Mali TBDR execution with CPU command translation at pass boundaries without excessive queue submits.
+            chunk = e ? atol(e) : vk_driver_is_qualcomm() ? 0 : g_vk.props.vendorID == 0x13B5 ? 8000 : 2000;
         }
         static uint64_t chunk_frame;
         static uint32_t chunk_submits;
@@ -3508,7 +3571,7 @@ static int pipe_keep(void) {
             keep = atoi(e);
         } else if (g_vk.props.vendorID == 0x5143 && !vk_low_ram()) {
             keep = 0;
-        } else if (!vk_low_ram()) {
+        } else if (!vk_conserve_ram()) {
             long total_kb = 0;
             FILE *f = fopen("/proc/meminfo", "r");
             if (f) {
@@ -3516,6 +3579,8 @@ static int pipe_keep(void) {
                 fclose(f);
             }
             keep = (total_kb >= 7L * 1024 * 1024) ? 4096 : 1500;
+        } else if (g_vk.props.vendorID == 0x13B5 && !vk_low_ram()) {
+            keep = 1200;
         } else {
             keep = 800;
         }
@@ -3538,8 +3603,12 @@ static void pipe_evict(void) {
     if (live <= keep) return;
     uint64_t done = vk_completed_seq();
     int target = keep * 4 / 5, gone = 0;
-    // oldest first: two passes, the unused for 10 minutes, then for 3 minutes
-    static const uint64_t ages[2] = {600000000000ull, 180000000000ull};
+    // oldest first: two passes, shorter windows when conserving RAM
+    const bool conserve = vk_conserve_ram();
+    const uint64_t ages[2] = {
+        conserve ? 90000000000ull : 600000000000ull,
+        conserve ? 30000000000ull : 180000000000ull,
+    };
     for (int pass = 0; pass < 2 && live > target; pass++) {
         uint64_t age = ages[pass];
         for (size_t i = 0; i < pipe_cache.capacity && live > target; i++) {
@@ -4082,17 +4151,18 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
         uint32_t sgen;
         bool clean;
     } RfMemo;
-    static RfMemo rf_memo[16];
+    static RfMemo rf_memo[128];
     bool bindless = pr->vi_bindless || pr->fi_bindless;
     uint64_t cur_frame = !always && !g_debug_frame && !naliases ? vk_frame_counter() : 0;
-    uint32_t rslot = (uint32_t)((((uintptr_t)pr >> 4) ^ st_tex_ver[1]) & 15u);
+    uint32_t rslot = (uint32_t)((((uintptr_t)pr * 0x9E3779B97F4A7C15ull) >> 32) ^
+                                (st_tex_ver[1] * 0xC2B2AE3Du) ^ (uint32_t)st_rt_ver) & 127u;
     if (!always && !g_debug_frame && !naliases) {
         RfMemo *m = &rf_memo[rslot];
         if (m->clean && m->pr == pr && m->rt_ver == st_rt_ver && m->t0_ver == st_tex_ver[0] &&
-            m->t1_ver == st_tex_ver[1] && m->u0_ver == st_ubuf_ver[0] && m->u1_ver == st_ubuf_ver[1] &&
-            m->pool_ver == st_pool_ver && m->gcopy_ver == g_gpu_copy_ver && m->sgen == tex_slot_gen &&
+            m->t1_ver == st_tex_ver[1] && m->pool_ver == st_pool_ver && m->gcopy_ver == g_gpu_copy_ver && m->sgen == tex_slot_gen &&
             m->frame == cur_frame &&
-            (!bindless || (m->ubo_data_ver == st_ubo_data_ver && m->exec_seq == g_exec_list_seq))) {
+            (!bindless || (m->u0_ver == st_ubuf_ver[0] && m->u1_ver == st_ubuf_ver[1] &&
+                           m->ubo_data_ver == st_ubo_data_ver && m->exec_seq == g_exec_list_seq))) {
             return;
         }
     }
@@ -4271,6 +4341,20 @@ static uint64_t cbwin_row_(uint64_t addr, uint64_t size);
 #endif
 // (cbwin) the patch buffers of the draw being bound, vertex and fragment: shader.h maxwell_cb_window
 static struct { uint32_t m[4], rows[64][4]; } cbw_patch[2];
+static uint16_t cbw_dirty_rows[2];
+static inline void cbw_clear(void) {
+    for (int s = 0; s < 2; s++) {
+        if (cbw_patch[s].m[0] || cbw_dirty_rows[s]) {
+            memset(cbw_patch[s].m, 0, sizeof cbw_patch[s].m);
+            uint32_t nr = cbw_dirty_rows[s];
+            if (nr) {
+                if (nr > 64) nr = 64;
+                memset(cbw_patch[s].rows, 0, (size_t)nr * 16);
+                cbw_dirty_rows[s] = 0;
+            }
+        }
+    }
+}
 
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
 // BOTW's half-size passes on a scaled scene (from SavageWindRecomp's up_fix, MIT): the draws that bring its half-size
@@ -4449,9 +4533,19 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     }
     if (k == 1) {  // compiler constants stored after the shader code
         NvnShaderStage *ss = &st.program->stages[stage];
+        uint64_t addr = ss->code_addr + ss->const_offset;
         uint64_t size = ss->const_size ? ss->const_size : 16;
         if (size < si->cbuf_size[1]) size = si->cbuf_size[1];
-        return ubo_span(guest_copy(ss->code_addr + ss->const_offset, size), size);  // (constant: shared per submission)
+        typedef struct { uint64_t addr, size, epoch, gcopy, exec_seq; VkDescriptorBufferInfo info; } K1Ent;
+        static K1Ent k1[256];
+        uint32_t s = (uint32_t)(((addr >> 4) ^ (size << 3)) & 255u);
+        K1Ent *e = &k1[s];
+        if (e->addr == addr && e->size == size && e->epoch == chunk_epoch &&
+            e->gcopy == gcopy_gen && e->exec_seq == g_exec_list_seq)
+            return e->info;
+        VkDescriptorBufferInfo info = ubo_span(guest_copy(addr, size), size);  // (constant: shared per submission)
+        *e = (K1Ent){addr, size, chunk_epoch, gcopy_gen, g_exec_list_seq, info};
+        return info;
     }
     int idx = k - 3;  // cbuf_base
     Range r = (idx >= 0 && idx < 18) ? st.ubuf[stage][idx] : (Range){0, 0};
@@ -4848,6 +4942,7 @@ static bool cbwin_bind(int stage, int k, uint64_t addr, uint64_t size, VkDescrip
     cbw_patch[stage].m[0] = (uint32_t)k + 1;
     cbw_patch[stage].m[1] = (uint32_t)((first - addr) >> 4);
     cbw_patch[stage].m[2] = (uint32_t)n;
+    if (n > cbw_dirty_rows[stage]) cbw_dirty_rows[stage] = (uint16_t)n;
     stat_cbwin++;
     return true;
 }
@@ -6005,7 +6100,7 @@ static uint64_t vc_budget(void) {
             if (fscanf(f, "MemTotal: %ld kB", &total_kb) != 1) total_kb = 0;
             fclose(f);
         }
-        b = 768ull << 20;
+        b = vk_conserve_ram() ? 256ull << 20 : 768ull << 20;
         if (vk_low_ram() && total_kb && (uint64_t)total_kb * 1024 / 12 < b)
             b = (uint64_t)total_kb * 1024 / 12;
         if (e && atol(e) > 0) b = (uint64_t)atol(e) << 20;
@@ -6448,6 +6543,55 @@ static uint64_t fii_memo_active_id;  // non-zero when draw_() reused or recorded
 
 static bool is_ubo(VkDescriptorType t) { return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; }
 
+#ifdef __ANDROID__
+#define STAGE_FAST_BUCKETS 128
+typedef struct {
+    ShaderInfo *si;
+    VkDescriptorSetLayout layout;
+    VkDescriptorSet ds;
+    VkBuffer gmem_buf;
+    uint64_t ubuf_ver, sbuf_ver, tex_ver, img_ver, pool_ver, ubo_data_ver, exec_seq, epoch, gcopy_gen, frame;
+    uint64_t fii_stamp;
+    uint32_t rgen, vgen, sgen, bank_epoch, ndyn, dyn[24];
+    float rs0[4], tint[8], mirror_w;
+    int8_t bank;
+    uint8_t set;
+} StageSetFast;
+static StageSetFast fast_tab[2][STAGE_FAST_BUCKETS][2];
+
+static inline uint32_t fast_bucket_idx(const ShaderInfo *si, VkDescriptorSetLayout layout, int stage) {
+    uint64_t h = ((uint64_t)(uintptr_t)si * 0x9E3779B97F4A7C15ull) ^
+                 ((uint64_t)(uintptr_t)layout * 0xC2B2AE3D27D4EB4Full) ^
+                 (st_ubuf_ver[stage] * 0x165667B19E3779F9ull) ^
+                 (st_tex_ver[stage] * 0x94D049BB133111EBull);
+    h ^= h >> 32;
+    return (uint32_t)(h ^ (h >> 16)) & (STAGE_FAST_BUCKETS - 1u);
+}
+
+static inline void fast_tab_insert(StageSetFast *way, ShaderInfo *si, VkDescriptorSetLayout layout,
+                                   VkDescriptorSet ds, int stage, uint32_t set, int8_t bank, uint32_t bank_epoch,
+                                   uint64_t fii_stamp, uint64_t cur_frame, uint32_t rgen, uint32_t vgen,
+                                   uint32_t sgen, const float rs0[4], const float tint[8], const uint32_t *dyn,
+                                   uint32_t ndyn) {
+    way[1] = way[0];
+    way[0] = (StageSetFast){
+        .si = si, .layout = layout, .ds = ds, .gmem_buf = gmem_buf,
+        .ubuf_ver = st_ubuf_ver[stage], .sbuf_ver = st_sbuf_ver[stage],
+        .tex_ver = st_tex_ver[stage], .img_ver = st_img_ver[stage],
+        .pool_ver = st_pool_ver, .ubo_data_ver = st_stage_ubo_data_ver[stage],
+        .exec_seq = g_exec_list_seq, .epoch = chunk_epoch,
+        .gcopy_gen = gcopy_gen, .frame = cur_frame,
+        .fii_stamp = fii_stamp,
+        .rgen = rgen, .vgen = vgen, .sgen = sgen,
+        .bank_epoch = bank_epoch, .ndyn = ndyn, .mirror_w = g_mirror_w,
+        .bank = bank, .set = (uint8_t)set,
+    };
+    if (ndyn) memcpy(way[0].dyn, dyn, ndyn * sizeof dyn[0]);
+    memcpy(way[0].rs0, rs0, sizeof way[0].rs0);
+    memcpy(way[0].tint, tint, sizeof way[0].tint);
+}
+#endif
+
 // dyn / ndyn: the set's dynamic uniform buffer offsets, in binding order (its bindings of that type: compile_program)
 static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
                                  const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii,
@@ -6468,30 +6612,17 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     bool can_fast = !fast_off && !set_cache_off && stage < 2 && !bindless && !si->uses_gmem_map &&
                     !up_fix.sx && !ui_pass_vs && !naliases && !nfeedback && !scene_up.t &&
                     (stage == 0 || (pre_ii && fii_memo_active_id));
-    typedef struct {
-        ShaderInfo *si;
-        VkDescriptorSetLayout layout;
-        VkDescriptorSet ds;
-        VkBuffer gmem_buf;
-        uint64_t ubuf_ver, sbuf_ver, tex_ver, img_ver, pool_ver, ubo_data_ver, exec_seq, epoch, gcopy_gen, frame;
-        uint64_t fii_stamp;
-        uint32_t rgen, vgen, sgen, bank_epoch, ndyn, dyn[24];
-        float rs0[4], tint[8], mirror_w;
-        int8_t bank;
-        uint8_t set;
-    } StageSetFast;
-    static StageSetFast fast_tab[2][8];
-    static uint8_t fast_rr[2];
-    int fstage = stage < 2 ? stage : 0;
+    uint32_t fbucket = can_fast ? fast_bucket_idx(si, layout, stage) : 0;
     if (can_fast) {
-        for (int i = 0; i < 8; i++) {
-            StageSetFast *f = &fast_tab[fstage][i];
+        StageSetFast *way = fast_tab[stage][fbucket];
+        for (int i = 0; i < 2; i++) {
+            StageSetFast *f = &way[i];
             if (f->si == si && f->layout == layout && f->set == (uint8_t)set && f->ds &&
                 f->bank >= 0 && desc_banks[(int)f->bank].epoch == f->bank_epoch &&
                 f->rgen == desc_res_gen && f->vgen == vk_view_gen && f->sgen == tex_slot_gen &&
                 f->ubuf_ver == st_ubuf_ver[stage] && f->sbuf_ver == st_sbuf_ver[stage] &&
                 f->tex_ver == st_tex_ver[stage] && f->img_ver == st_img_ver[stage] &&
-                f->pool_ver == st_pool_ver && f->ubo_data_ver == st_ubo_data_ver &&
+                f->pool_ver == st_pool_ver && f->ubo_data_ver == st_stage_ubo_data_ver[stage] &&
                 f->exec_seq == g_exec_list_seq && f->epoch == chunk_epoch &&
                 f->gcopy_gen == gcopy_gen && f->frame == cur_frame && f->gmem_buf == gmem_buf &&
                 (stage == 0 || (f->fii_stamp == fii_memo_active_id &&
@@ -6501,8 +6632,13 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 desc_banks[(int)f->bank].last_seq = pending;
                 if (dyn && f->ndyn) memcpy(dyn, f->dyn, f->ndyn * sizeof f->dyn[0]);
                 if (ndyn) *ndyn = f->ndyn;
+                if (i == 1) {
+                    StageSetFast tmp = way[0];
+                    way[0] = way[1];
+                    way[1] = tmp;
+                }
                 prof_set_hits++;
-                return f->ds;
+                return way[0].ds;
             }
         }
     }
@@ -6699,25 +6835,10 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             }
             if (!set_cache_off && ent->h1 == h1 && ent->h2 == h2) {
                 desc_banks[(int)ent->bank].last_seq = pending;
-                if (can_fast && dyn && nd <= 24) {
-                    StageSetFast *f = &fast_tab[fstage][fast_rr[fstage] & 7u];
-                    fast_rr[fstage]++;
-                    *f = (StageSetFast){
-                        .si = si, .layout = layout, .ds = ent->ds, .gmem_buf = gmem_buf,
-                        .ubuf_ver = st_ubuf_ver[stage], .sbuf_ver = st_sbuf_ver[stage],
-                        .tex_ver = st_tex_ver[stage], .img_ver = st_img_ver[stage],
-                        .pool_ver = st_pool_ver, .ubo_data_ver = st_ubo_data_ver,
-                        .exec_seq = g_exec_list_seq, .epoch = chunk_epoch,
-                        .gcopy_gen = gcopy_gen, .frame = cur_frame,
-                        .fii_stamp = fii_memo_active_id,
-                        .rgen = desc_res_gen, .vgen = vk_view_gen, .sgen = tex_slot_gen,
-                        .bank_epoch = ent->epoch, .ndyn = nd, .mirror_w = g_mirror_w,
-                        .bank = ent->bank, .set = (uint8_t)set,
-                    };
-                    if (nd) memcpy(f->dyn, dyn, nd * sizeof dyn[0]);
-                    memcpy(f->rs0, rs0_cur, sizeof rs0_cur);
-                    memcpy(f->tint, tint_cur, sizeof tint_cur);
-                }
+                if (can_fast && dyn && nd <= 24)
+                    fast_tab_insert(fast_tab[stage][fbucket], si, layout, ent->ds, stage, set, ent->bank,
+                                    ent->epoch, fii_memo_active_id, cur_frame, desc_res_gen, vk_view_gen,
+                                    tex_slot_gen, rs0_cur, tint_cur, dyn, nd);
                 prof_set_hits++;
                 return ent->ds;
             }
@@ -6748,25 +6869,10 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             desc_banks[bank].last_seq = pending;
             *e = (SetCacheEnt){.h1 = h1, .h2 = h2, .ds = ds, .epoch = desc_banks[bank].epoch,
                                .rgen = desc_res_gen, .vgen = vk_view_gen, .bank = (int8_t)bank};
-            if (can_fast && dyn && nd <= 24) {
-                StageSetFast *f = &fast_tab[fstage][fast_rr[fstage] & 7u];
-                fast_rr[fstage]++;
-                *f = (StageSetFast){
-                    .si = si, .layout = layout, .ds = ds, .gmem_buf = gmem_buf,
-                    .ubuf_ver = st_ubuf_ver[stage], .sbuf_ver = st_sbuf_ver[stage],
-                    .tex_ver = st_tex_ver[stage], .img_ver = st_img_ver[stage],
-                    .pool_ver = st_pool_ver, .ubo_data_ver = st_ubo_data_ver,
-                    .exec_seq = g_exec_list_seq, .epoch = chunk_epoch,
-                    .gcopy_gen = gcopy_gen, .frame = cur_frame,
-                    .fii_stamp = fii_memo_active_id,
-                    .rgen = desc_res_gen, .vgen = vk_view_gen, .sgen = tex_slot_gen,
-                    .bank_epoch = desc_banks[bank].epoch, .ndyn = nd, .mirror_w = g_mirror_w,
-                    .bank = (int8_t)bank, .set = (uint8_t)set,
-                };
-                if (nd) memcpy(f->dyn, dyn, nd * sizeof dyn[0]);
-                memcpy(f->rs0, rs0_cur, sizeof rs0_cur);
-                memcpy(f->tint, tint_cur, sizeof tint_cur);
-            }
+            if (can_fast && dyn && nd <= 24)
+                fast_tab_insert(fast_tab[stage][fbucket], si, layout, ds, stage, set, (int8_t)bank,
+                                desc_banks[bank].epoch, fii_memo_active_id, cur_frame, desc_res_gen,
+                                vk_view_gen, tex_slot_gen, rs0_cur, tint_cur, dyn, nd);
         }
         return ds;
     }
@@ -7139,14 +7245,16 @@ static void draw_(CmdRec *r, bool indexed) {
             // (memoized per shader address, checked against a copy of its bytes: the byte-serial hash on every
             // fragment-shader change was ~40% of draw_)
             // (1024 slots: BOTW draws a few hundred fragment shaders a frame, and 64 kept colliding)
-            static struct { uint64_t addr, hash; uint8_t code[0x200]; } fsh[1024];
+            static struct { uint64_t addr, hash, exec_seq; uint8_t code[0x200]; } fsh[1024];
             const void *code = (const void *)(uintptr_t)(fs + 0x30);
             unsigned i = (unsigned)((fs * 0x9E3779B97F4A7C15ull) >> 54);
             if (!fs) last_hash = 0;
-            else if (fsh[i].addr == fs && !memcmp(fsh[i].code, code, 0x200)) last_hash = fsh[i].hash;
-            else {
+            else if (fsh[i].addr == fs && (fsh[i].exec_seq == g_exec_list_seq || !memcmp(fsh[i].code, code, 0x200))) {
+                fsh[i].exec_seq = g_exec_list_seq;
+                last_hash = fsh[i].hash;
+            } else {
                 last_hash = hmix(1469598103934665603ull, code, 0x200);
-                fsh[i].addr = fs, fsh[i].hash = last_hash;
+                fsh[i].addr = fs; fsh[i].hash = last_hash; fsh[i].exec_seq = g_exec_list_seq;
                 memcpy(fsh[i].code, code, 0x200);
             }
 #else
@@ -7442,10 +7550,35 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     if (vk_narrow_pass_barrier_on() && g_gpu_write_serial > g_vertex_synced_serial) {
         bool need_vtx_sync = pr->vi_bindless || pr->vi_image || pr->vi->uses_gmem_map || pr->vi->uses_gmem_store;
-        for (int i = 0; i < pr->vi->ntex && !need_vtx_sync; i++) {
-            NvnTexture *vt = shader_texture_object(0, &pr->vi->tex[i]);
-            TexBackend *vb = vt ? (TexBackend *)vt->backend : NULL;
-            if (vb && vb->rendered_serial > g_vertex_synced_serial) need_vtx_sync = true;
+        if (!need_vtx_sync && pr->vi->ntex) {
+            extern uint32_t tex_slot_gen;
+            typedef struct {
+                ShaderInfo *vi;
+                uint64_t tex_ver, pool_ver, write_serial, sync_serial, frame;
+                uint32_t sgen;
+                bool result;
+            } VtxSyncMemo;
+            static VtxSyncMemo vsm[32];
+            uint64_t cur_f = vk_frame_counter();
+            uint32_t vs = (uint32_t)((((uintptr_t)pr->vi * 0x9E3779B97F4A7C15ull) >> 32) ^
+                                     (st_tex_ver[0] * 0xC2B2AE3Du)) & 31u;
+            VtxSyncMemo *m = &vsm[vs];
+            if (m->vi == pr->vi && m->tex_ver == st_tex_ver[0] && m->pool_ver == st_pool_ver &&
+                m->sgen == tex_slot_gen && m->write_serial == g_gpu_write_serial &&
+                m->sync_serial == g_vertex_synced_serial && m->frame == cur_f) {
+                need_vtx_sync = m->result;
+            } else {
+                for (int i = 0; i < pr->vi->ntex && !need_vtx_sync; i++) {
+                    NvnTexture *vt = shader_texture_object(0, &pr->vi->tex[i]);
+                    TexBackend *vb = vt ? (TexBackend *)vt->backend : NULL;
+                    if (vb && vb->rendered_serial > g_vertex_synced_serial) need_vtx_sync = true;
+                }
+                *m = (VtxSyncMemo){
+                    .vi = pr->vi, .tex_ver = st_tex_ver[0], .pool_ver = st_pool_ver,
+                    .write_serial = g_gpu_write_serial, .sync_serial = g_vertex_synced_serial,
+                    .frame = cur_f, .sgen = tex_slot_gen, .result = need_vtx_sync,
+                };
+            }
         }
         if (need_vtx_sync) {
             vk_end_pass();
@@ -7765,7 +7898,7 @@ static void draw_(CmdRec *r, bool indexed) {
     }
 #endif
     uint32_t dyn[64], ndv = 0, ndf = 0;  // (the sets' dynamic uniform buffer offsets: vertex, then fragment)
-    memset(cbw_patch, 0, sizeof cbw_patch);  // (cbwin_bind fills them while the sets are written)
+    cbw_clear();  // (cbwin_bind fills them while the sets are written)
     VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndv);
     PROF_ADD(prof_sets);
     VkDescriptorImageInfo fii[64];
@@ -7780,7 +7913,7 @@ static void draw_(CmdRec *r, bool indexed) {
         float sc[64][2];
         uint32_t wh[64][2];
     } FiiMemo;
-    static FiiMemo fii_memo[8];
+    static FiiMemo fii_memo[64];
     extern uint32_t vk_view_gen, tex_slot_gen;
     static uint64_t next_fii_stamp = 1;
     fii_memo_active_id = 0;
@@ -7789,7 +7922,8 @@ static void draw_(CmdRec *r, bool indexed) {
     if (can_fii_memo && pr->fi->ntex == 0) {
         fii_memo_active_id = 1;
     } else if (can_fii_memo) {
-        uint32_t fs = (uint32_t)((((uintptr_t)pr->fi >> 4) ^ st_tex_ver[1]) & 7u);
+        uint32_t fs = (uint32_t)((((uintptr_t)pr->fi * 0x9E3779B97F4A7C15ull) >> 32) ^
+                                 (st_tex_ver[1] * 0xC2B2AE3Du)) & 63u;
         FiiMemo *fm = &fii_memo[fs];
         if (fm->fi == pr->fi && fm->ntex == pr->fi->ntex && fm->tex_ver == st_tex_ver[1] &&
             fm->pool_ver == st_pool_ver && fm->frame == fii_frame && fm->vgen == vk_view_gen &&
@@ -7834,7 +7968,7 @@ static void draw_(CmdRec *r, bool indexed) {
             up_fix.sx = (float)gb->width / (float)gt->width, up_fix.sy = (float)gb->height / (float)gt->height;
             up_fix.tw = gt->width, up_fix.th = gt->height, up_fix.aw = gb->width, up_fix.ah = gb->height;
             ndv = 0;  // (the vertex set again, with its constants patched)
-            memset(cbw_patch, 0, sizeof cbw_patch);
+            cbw_clear();
             vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndv);
         }
     }
@@ -9197,6 +9331,18 @@ static void exec_list(uint64_t handle, int depth) {
                 memcpy((void *)(uintptr_t)dst, x, sz);
                 guest_copy_invalidate(dst, dst + sz);
                 st_ubo_data_ver++;
+                uint64_t u_hi = dst + sz;
+                for (int s = 0; s < 6; s++) {
+                    for (int b = 0; b < 18; b++) {
+                        uint64_t ba = st.ubuf[s][b].addr;
+                        if (!ba) continue;
+                        uint64_t bsz = st.ubuf[s][b].size ? st.ubuf[s][b].size : 0x10000ull;
+                        if (ba < u_hi && dst < ba + bsz) {
+                            st_stage_ubo_data_ver[s]++;
+                            break;
+                        }
+                    }
+                }
             }
             break;
         }

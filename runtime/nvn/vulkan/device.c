@@ -889,10 +889,9 @@ static void create_device(void) {
     ai.vulkanApiVersion = g_vk.api;
     VmaVulkanFunctions vf = {.vkGetInstanceProcAddr = vkGetInstanceProcAddr, .vkGetDeviceProcAddr = vkGetDeviceProcAddr};
     ai.pVulkanFunctions = &vf;  // (VMA_DYNAMIC_VULKAN_FUNCTIONS: from the driver volk loaded)
-    {   // Low RAM (exec.c vk_low_ram): 32 MB blocks, not VMA's 256 MB - a block taken whole for a few textures (the GPU
-        // memory went from 96 to 480 MB at once on a 4 GB tablet's title screen)
-        extern bool vk_low_ram(void);
-        if (vk_low_ram()) ai.preferredLargeHeapBlockSize = 32ull << 20;
+    {   // Low RAM / Mali UMA conservation (exec.c vk_conserve_ram): 32 MB blocks, not VMA's 256 MB
+        extern bool vk_conserve_ram(void);
+        if (vk_conserve_ram()) ai.preferredLargeHeapBlockSize = 32ull << 20;
     }
 #endif
     VK_CHECK(vmaCreateAllocator(&ai, &g_vk.vma));
@@ -1697,10 +1696,16 @@ void backend_present(NvnTexture *t) {
         extern void vk_gpuprof_report(void);
         if (g_gpuprof_frame) { g_gpuprof_frame = false; vk_gpuprof_report(); }
         const char *e = getenv("LARECOMP_GPUPROF_AT");
-        for (const char *p = e; p && *p;) {
-            long at = strtol(p, (char **)&p, 10);
-            if (at == (long)total_frames) { g_gpuprof_frame = true; break; }
-            if (*p == ',') p++; else break;
+        if (e) {
+            for (const char *p = e; *p;) {
+                long at = strtol(p, (char **)&p, 10);
+                if (at == (long)total_frames) { g_gpuprof_frame = true; break; }
+                if (*p == ',') p++; else break;
+            }
+#ifdef __ANDROID__
+        } else if (g_settings.vk_prof && total_frames >= 450 && (total_frames - 450) % 240 == 0) {
+            g_gpuprof_frame = true;
+#endif
         }
     }
     if (g_debug_frame) LOG("===== debug frame %llu =====\n", (unsigned long long)total_frames);
