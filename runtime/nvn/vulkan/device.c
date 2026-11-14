@@ -548,7 +548,7 @@ static void create_device(void) {
         const char *e = getenv("LARECOMP_VK_HOST_IMPORT");
         bool xclipse = strstr(g_vk.props.deviceName, "Xclipse") || g_vk.props.vendorID == 0x144D;  // (Samsung)
         bool by_setting = g_settings.gpu_heap == 0 && !vk_driver_is_turnip();
-        if (mali && !e) setenv("LARECOMP_VK_NO_GRES", "1", 0);
+        // Keep gres enabled on Mali r54p1+ while host_import stays off so compute global stores remain GPU-resident.
         if (e ? !atoi(e) : xclipse || mali || by_setting) {
             g_vk.host_import = false;
             LOG("[vk] guest heap import left off (%s)\n", e ? "LARECOMP_VK_HOST_IMPORT=0" :

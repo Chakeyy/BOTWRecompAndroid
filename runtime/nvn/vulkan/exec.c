@@ -1088,7 +1088,7 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
 }
 
 #ifdef __ANDROID__
-#define DESC_BANKS 4
+#define DESC_BANKS 8
 #define DESC_BANK_MAX_SETS 6144
 typedef struct {
     VkDescriptorPool pool;
@@ -2213,7 +2213,8 @@ static void begin_pass(void) {
             // GPU time and stayed at 30 even indoors; a whole frame at once, it chose 60 there)
             extern bool vk_driver_is_qualcomm(void);
             const char *e = getenv("LARECOMP_VK_CHUNK_US");
-            chunk = e ? atol(e) : vk_driver_is_qualcomm() ? 0 : 2000;
+            // Disable mid-frame chunk flushes on Qualcomm and Mali TBDR (matches split_long_pass).
+            chunk = e ? atol(e) : (vk_driver_is_qualcomm() || g_vk.props.vendorID == 0x13B5) ? 0 : 2000;
         }
         extern int vk_ab(const char *what);
         long ch = chunk > 0 && AB("chunk") == 1 ? 500 : chunk;
@@ -5112,6 +5113,9 @@ static bool gres_init(void) {
     VkMemoryPropertyFlags mf;
     vmaGetMemoryTypeProperties(g_vk.vma, inf.memoryType, &mf);
     ga_noncoherent = !(mf & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    // Clear and flush GMISS tail guard page before first compute dispatch on non-coherent Mali heaps.
+    memset((uint8_t *)ga_ptr + (uint64_t)GMISS_WORD * 4, 0, 4096);
+    ga_wrote((uint64_t)GMISS_WORD * 4, 4096);
     LOG("[vk] global memory arena: %llu MB (what shaders store stays on the GPU), memory type %u (flags 0x%x%s)\n",
         (unsigned long long)(GA_SIZE >> 20), inf.memoryType, (unsigned)mf, ga_noncoherent ? ": flushed and invalidated" : "");
     return true;
@@ -5501,6 +5505,10 @@ static void gres_reset(void) {
     ga_ndirty = 0;
     gl_n = 0;
     memset(ga_seg_seq, 0, sizeof ga_seg_seq);
+    if (ga_ptr) {
+        memset((uint8_t *)ga_ptr + (uint64_t)GMISS_WORD * 4, 0, 4096);
+        ga_wrote((uint64_t)GMISS_WORD * 4, 4096);
+    }
 }
 
 // The storage buffers of the stages in stage_mask (bit = st.sbuf index) into the ring; store: copied back later.
@@ -5565,11 +5573,12 @@ static bool gsnap_prepare(void) {
     gc_size = 0;
     GcRange r[16];
     int n = 0;
+    uint64_t gmax = gmem_size ? gmem_size : HEAP_MAX;  // gmem_size is 0 in gcopy_mode
     for (int i = 0; i < 16; i++) {
         uint64_t a = st.sbuf[0][i].addr, sz = st.sbuf[0][i].size;
-        if (!a || !sz || a < HEAP_BASE || a - HEAP_BASE + sz > gmem_size) continue;
+        if (!a || !sz || a < HEAP_BASE || sz > gmax || a - HEAP_BASE > gmax - sz) continue;
         uint64_t lo = (a - HEAP_BASE) & ~255ull, hi = (a - HEAP_BASE + sz + 255) & ~255ull;
-        if (hi > gmem_size) hi = gmem_size;
+        if (hi > gmax) hi = gmax;
         int k = n++;
         while (k > 0 && r[k - 1].lo > lo) { r[k] = r[k - 1]; k--; }
         r[k].lo = lo; r[k].hi = hi;
@@ -6294,16 +6303,29 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             uint32_t epoch, rgen, vgen;
             int8_t bank;
         } SetCacheEnt;
-        static SetCacheEnt cache[8192];
+        static SetCacheEnt cache[4096][4];
+        static uint8_t way_rr[4096];
         uint64_t pending = vk_pending_seq();
-        uint32_t slot = (uint32_t)(h1 ^ (h1 >> 32)) & 8191;
-        SetCacheEnt *e = &cache[slot];
-        if (!off && e->ds && e->h1 == h1 && e->h2 == h2 && e->rgen == desc_res_gen && e->vgen == vk_view_gen) {
-            if (e->bank >= 0 && desc_banks[(int)e->bank].epoch == e->epoch) {
-                desc_banks[(int)e->bank].last_seq = pending;
-                prof_set_hits++;
-                return e->ds;
+        uint32_t bucket = (uint32_t)(h1 ^ (h1 >> 32)) & 4095u;
+        SetCacheEnt *set = cache[bucket];
+        SetCacheEnt *e = NULL;
+        for (int i = 0; i < 4; i++) {
+            SetCacheEnt *ent = &set[i];
+            bool valid = ent->ds && ent->rgen == desc_res_gen && ent->vgen == vk_view_gen &&
+                         ent->bank >= 0 && desc_banks[(int)ent->bank].epoch == ent->epoch;
+            if (!valid) {
+                if (!e) e = ent;
+                continue;
             }
+            if (!off && ent->h1 == h1 && ent->h2 == h2) {
+                desc_banks[(int)ent->bank].last_seq = pending;
+                prof_set_hits++;
+                return ent->ds;
+            }
+        }
+        if (!e) {
+            e = &set[way_rr[bucket]];
+            way_rr[bucket] = (uint8_t)((way_rr[bucket] + 1u) & 3u);
         }
         prof_set_miss++;
         uint64_t tw_ = prof > 0 ? plat_now_ns() : 0;
@@ -7227,14 +7249,17 @@ static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_dyn += SDL_GetTicksNS() - prof_td_;
     PROF_T0();
 #ifdef __ANDROID__
-    if (gcopy_mode && (pr->vi->uses_gmem_map || pr->fi->uses_gmem_map))  // (the table both stages' sets use)
-        gcopy_prepare((pr->vi->uses_gmem_map ? 1u : 0u) | (pr->fi->uses_gmem_map ? 2u : 0u),
-                      pr->vi->uses_gmem_store || pr->fi->uses_gmem_store);
-    else if (gwin_mode && (pr->vi->uses_gmem_map || pr->fi->uses_gmem_map)) {
-        static int snap = -1;  // (LARECOMP_NO_GSNAP=1: through the window as before)
+    if ((gcopy_mode || gwin_mode) && (pr->vi->uses_gmem_map || pr->fi->uses_gmem_map)) {  // (the table both stages' sets use)
+        static int snap = -1;  // (LARECOMP_NO_GSNAP=1: through gcopy/gwin as before)
         if (snap < 0) snap = getenv("LARECOMP_NO_GSNAP") == NULL;
-        if (!(snap && pr->vi->uses_gmem_map && !pr->fi->uses_gmem_map && !pr->vi->uses_gmem_store && gsnap_prepare()))
-            gwin_prepare((pr->vi->uses_gmem_map ? 1u : 0u) | (pr->fi->uses_gmem_map ? 2u : 0u));
+        bool snapped = snap && pr->vi->uses_gmem_map && !pr->fi->uses_gmem_map && !pr->vi->uses_gmem_store && gsnap_prepare();
+        if (!snapped) {
+            uint32_t mask = (pr->vi->uses_gmem_map ? 1u : 0u) | (pr->fi->uses_gmem_map ? 2u : 0u);
+            if (gcopy_mode)
+                gcopy_prepare(mask, pr->vi->uses_gmem_store || pr->fi->uses_gmem_store);
+            else
+                gwin_prepare(mask);
+        }
     }
 #endif
     uint32_t dyn[64], ndv = 0, ndf = 0;  // (the sets' dynamic uniform buffer offsets: vertex, then fragment)
