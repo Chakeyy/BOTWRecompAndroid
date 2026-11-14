@@ -13,6 +13,7 @@
 // Test overrides: LARECOMP_SCALE=<f> (the scene's height = 900 x f), LARECOMP_WIDE_TEST=<f> (forced shape).
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "../hle.h"
 #include "../settings.h"
@@ -91,8 +92,16 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
         // (LARECOMP_OUT_LINES=<n> for tests: the same, over the setting)
         static double env_lines = -1;
         if (env_lines < 0) env_lines = getenv("LARECOMP_OUT_LINES") ? atof(getenv("LARECOMP_OUT_LINES")) : 0;
-        out_auto = env_lines <= 0 && g_settings.out_lines == OUT_AUTO;  // (Auto: 1080 lines at most)
-        double out_lines = env_lines > 0 ? env_lines : out_auto ? 1080 : g_settings.out_lines;
+        double auto_cap = 1080;
+#ifdef __ANDROID__
+        {   // Entry/mid Mali GPUs (G3x / G5x, e.g. Mali-G57 MC2) are strongly fillrate-bound at 1080p: Auto caps at 720p.
+            extern const char *vk_gpu_name(void);
+            const char *gpu = vk_gpu_name();
+            if (gpu && (strstr(gpu, "Mali-G5") || strstr(gpu, "Mali-G3"))) auto_cap = 720;
+        }
+#endif
+        out_auto = env_lines <= 0 && g_settings.out_lines == OUT_AUTO;  // (Auto: 1080 lines at most, or 720 on entry Mali)
+        double out_lines = env_lines > 0 ? env_lines : out_auto ? auto_cap : g_settings.out_lines;
         if (out_lines > 0 && sy * 1080.0 > out_lines) { double k = out_lines / (sy * 1080.0); sx *= k; sy *= k; }
     }
     h = sy;  // (Match display below: the final image's size, which is the screen's unless Output resolution is lower)

@@ -345,14 +345,14 @@ void settings_load(void) {
                                 : !strcmp(val, "sgsr1") ? UPSCALE_SGSR1
 #endif
                                 : UPSCALE_SHARP;
-        else if (!strcmp(key, "output")) {  // ("auto", "screen", or the final image's lines: 1080 / 900 / 720)
+        else if (!strcmp(key, "output")) {  // ("auto", "screen", or the final image's lines: 1080 / 900 / 720 / 540)
             int n = atoi(val);
-            g_settings.out_lines = !strcmp(val, "auto") ? OUT_AUTO : n == 1080 || n == 900 || n == 720 ? n : 0;
+            g_settings.out_lines = !strcmp(val, "auto") ? OUT_AUTO : n == 1080 || n == 900 || n == 720 || n == 540 ? n : 0;
             output_key = true;
         }
         else if (!strcmp(key, "output_resolution") && !output_key) {  // (0.1.11 and before: "screen" was only the default,
             int n = atoi(val);                                         // written by every save - read as Auto now)
-            g_settings.out_lines = n == 1080 || n == 900 || n == 720 ? n : g_defaults.out_lines;
+            g_settings.out_lines = n == 1080 || n == 900 || n == 720 || n == 540 ? n : g_defaults.out_lines;
         }
         else if (!strcmp(key, "antialias")) g_settings.antialias = !strcmp(val, "off") ? AA_OFF : !strcmp(val, "fxaa") ? AA_FXAA : AA_SMAA;
         else if (!strcmp(key, "language")) {  // ("auto" or one of the game's codes; anything else: auto)

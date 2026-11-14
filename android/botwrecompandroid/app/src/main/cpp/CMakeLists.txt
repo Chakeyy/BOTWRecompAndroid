@@ -77,7 +77,7 @@ endif()
 # -O2 -g whatever the Gradle build type (the Android runtime optimization flags): a debug build left the runtime at -O0, about half of the
 # game thread's time
 target_compile_options(main PRIVATE
-    -O2 -g -fno-strict-aliasing -fPIC -fno-semantic-interposition
+    -O3 -g -fno-strict-aliasing -fPIC -fno-semantic-interposition
     -march=armv8.2-a+crc+crypto+dotprod+fp16
     -fomit-frame-pointer -fno-math-errno
     -Wall -Wno-unused-function -Wno-format  # (as on Linux: %llx for uint64_t)

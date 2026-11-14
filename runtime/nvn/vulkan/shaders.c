@@ -140,14 +140,93 @@ static void strip_names(uint32_t *spv, size_t *nwords) {
     *nwords = o;
 }
 
+// Mali SPIR-V tuning: strip any OpNop/line debug remnants and set DontUnroll (0x2) on simple OpLoopMerge (246)
+// instructions so Mali's shader compiler avoids register spills from over-unrolling loops.
+static void optimize_spirv_mali(uint32_t *spv, size_t *nwords) {
+    enum { OP_NOP = 0, OP_LINE = 8, OP_LOOP_MERGE = 246, OP_NO_LINE = 317 };
+    size_t o = 5, n = *nwords;
+    for (size_t i = 5; i < n;) {
+        uint32_t wc = spv[i] >> 16, op = spv[i] & 0xFFFF;
+        if (!wc || i + wc > n) {
+            if (o != i) {
+                memmove(spv + o, spv + i, (n - i) * 4);
+                *nwords = o + (n - i);
+            }
+            return;
+        }
+        if (op == OP_NOP || op == OP_LINE || op == OP_NO_LINE) {
+            i += wc;
+            continue;
+        }
+        if (op == OP_LOOP_MERGE && wc >= 4 && (spv[i + 3] & ~3u) == 0) {
+            spv[i + 3] = (spv[i + 3] & ~1u) | 2u;
+        }
+        if (o != i) memmove(spv + o, spv + i, wc * 4);
+        o += wc;
+        i += wc;
+    }
+    *nwords = o;
+}
+
+// Opt-in fragment RelaxedPrecision (LARECOMP_MALI_FP16=1): keep vertex precision and NoContraction intact.
+static uint32_t *inject_fp16_mali(uint32_t *spv, size_t *nwords) {
+    enum { OP_TYPE_FLOAT = 22, OP_TYPE_VECTOR = 23, OP_DECORATE = 71, DEC_RELAXED = 0, DEC_BUILTIN = 11 };
+    size_t n = *nwords, insert = 0;
+    uint32_t bound = spv[3];
+    if (!bound) return spv;
+    uint8_t *fp32_t = calloc(bound, 1), *skip = calloc(bound, 1), *mark = calloc(bound, 1);
+    if (!fp32_t || !skip || !mark) { free(fp32_t); free(skip); free(mark); return spv; }
+    uint32_t f32 = 0;
+    size_t count = 0;
+    for (size_t i = 5; i < n;) {
+        uint32_t wc = spv[i] >> 16, op = spv[i] & 0xFFFF;
+        if (!wc || i + wc > n) break;
+        const uint32_t *w = spv + i;
+        if (!insert && ((op >= 19 && op <= 39) || (op >= 41 && op <= 52) || op == 59)) insert = i;
+        if (op == OP_TYPE_FLOAT && wc == 3 && w[2] == 32 && w[1] < bound) { f32 = w[1]; fp32_t[w[1]] = 1; }
+        else if (op == OP_TYPE_VECTOR && wc == 4 && f32 && w[2] == f32 && w[1] < bound) fp32_t[w[1]] = 1;
+        else if (op == OP_DECORATE && wc >= 3 && w[1] < bound && (w[2] == DEC_RELAXED || w[2] == DEC_BUILTIN)) skip[w[1]] = 1;
+        else if (wc >= 3 && (op == 87 || op == 88 || op == 129 || op == 131 || op == 133 || op == 142 || op == 148)) {
+            if (w[1] < bound && fp32_t[w[1]] && w[2] < bound && !skip[w[2]] && !mark[w[2]]) {
+                mark[w[2]] = 1;
+                count++;
+            }
+        }
+        i += wc;
+    }
+    if (!insert || !count) { free(fp32_t); free(skip); free(mark); return spv; }
+    uint32_t *out = malloc((n + count * 3) * 4);
+    if (!out) { free(fp32_t); free(skip); free(mark); return spv; }
+    memcpy(out, spv, insert * 4);
+    size_t o = insert;
+    for (uint32_t id = 0; id < bound; id++) {
+        if (!mark[id]) continue;
+        out[o++] = (3u << 16) | OP_DECORATE;
+        out[o++] = id;
+        out[o++] = DEC_RELAXED;
+    }
+    memcpy(out + o, spv + insert, (n - insert) * 4);
+    *nwords = o + (n - insert);
+    free(fp32_t); free(skip); free(mark); free(spv);
+    return out;
+}
+
 uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords) {
     bool optimized = getenv("LARECOMP_VK_OPT") != NULL;
+    const char *mopt_env = getenv("LARECOMP_MALI_SPIRV_OPT");
+    bool mali_opt = mopt_env ? atoi(mopt_env) != 0 : (g_vk.props.vendorID == 0x13B5);
+    const char *fp16_env = getenv("LARECOMP_MALI_FP16");
+    bool mali_fp16 = stage == STAGE_FRAGMENT && fp16_env && atoi(fp16_env) != 0;
 #ifdef __ANDROID__
     uint64_t h = vk_shader_source_hash(src, stage, optimized);
     uint32_t api = g_vk.api ? g_vk.api : VK_API_VERSION_1_3;  // (0: no device yet - as 1.3)
     if (api < VK_API_VERSION_1_3) h ^= (uint64_t)api << 32;  // (older SPIR-V for a device below 1.3, below)
+    if (mali_opt) h ^= 0x4d414c4953505631ull;
+    if (mali_fp16) h ^= 0x465031365f4d414bull;
 #else
     uint64_t h = src_hash(src, stage);
+    if (mali_opt) h ^= 0x4d414c4953505631ull;
+    if (mali_fp16) h ^= 0x465031365f4d414bull;
 #endif
     bool nocache = getenv("LARECOMP_VK_NO_SPIRV_CACHE") != NULL;
     uint32_t *out = nocache ? NULL : cache_load(h, nwords);
@@ -183,6 +262,8 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
         memcpy(out, shaderc_result_get_bytes(r), n);
         *nwords = n / 4;
         strip_names(out, nwords);
+        if (mali_opt) optimize_spirv_mali(out, nwords);
+        if (mali_fp16) out = inject_fp16_mali(out, nwords);
         if (stage == STAGE_VERTEX) out = no_contraction(out, nwords);
         if (!nocache) cache_store(h, out, *nwords);
     }

@@ -396,6 +396,7 @@ static pthread_mutex_t dead_lock = PTHREAD_MUTEX_INITIALIZER;
 // begins with one ("DEAD VIEW"). On unless LARECOMP_CHECK_VIEWS=0; a lock and a short probe per view, per pass.
 #define DV_N 65536
 static uint64_t dv_tab[DV_N];
+static uint32_t dv_dead_count;
 static pthread_mutex_t dv_lock = PTHREAD_MUTEX_INITIALIZER;
 static int dv_on = -1;
 static void dv_set(VkImageView v, bool dead) {
@@ -403,14 +404,30 @@ static void dv_set(VkImageView v, bool dead) {
     if (!dv_on || !v) return;
     uint64_t k = (uint64_t)v, h = (k * 0x9E3779B97F4A7C15ull) >> 48;
     pthread_mutex_lock(&dv_lock);
-    for (int p = 0; p < 64; p++, h = (h + 1) & (DV_N - 1)) {
-        if (dead && dv_tab[h] <= 1) { dv_tab[h] = k; break; }  // (an empty slot or a tombstone)
-        if (dv_tab[h] == k) { if (!dead) dv_tab[h] = 1; break; }  // (1: a tombstone)
+    if (dead) {
+        int tomb = -1;
+        for (int p = 0; p < 64; p++, h = (h + 1) & (DV_N - 1)) {
+            if (dv_tab[h] == k) { tomb = -1; break; }
+            if (dv_tab[h] == 1 && tomb < 0) tomb = (int)h;
+            if (!dv_tab[h]) { if (tomb < 0) tomb = (int)h; break; }
+        }
+        if (tomb >= 0) {
+            dv_tab[tomb] = k;
+            __atomic_fetch_add(&dv_dead_count, 1u, __ATOMIC_RELEASE);
+        }
+    } else {
+        for (int p = 0; p < 64 && dv_tab[h]; p++, h = (h + 1) & (DV_N - 1)) {
+            if (dv_tab[h] == k) {
+                dv_tab[h] = 1;
+                __atomic_fetch_sub(&dv_dead_count, 1u, __ATOMIC_RELEASE);
+                break;
+            }
+        }
     }
     pthread_mutex_unlock(&dv_lock);
 }
 bool vk_view_is_dead(VkImageView v) {
-    if (dv_on <= 0 || !v) return false;
+    if (dv_on <= 0 || !v || !__atomic_load_n(&dv_dead_count, __ATOMIC_ACQUIRE)) return false;
     uint64_t k = (uint64_t)v, h = (k * 0x9E3779B97F4A7C15ull) >> 48;
     bool r = false;
     pthread_mutex_lock(&dv_lock);
@@ -1857,7 +1874,13 @@ static VkSampler make_sampler(const NvnSamplerDesc *d, bool compare) {
     if (mf <= 1) si.maxLod = si.minLod + 0.25f;  // not mipmapped: stay on the base level
     if (si.maxLod < si.minLod) si.maxLod = si.minLod;
     si.mipLodBias = d->lod_bias;
-    if (d->max_aniso > 1) { si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = fminf(d->max_aniso, 16); }
+    static float cap_aniso = -1;
+    if (cap_aniso < 0) {
+        const char *ae = getenv("LARECOMP_MAX_ANISO");
+        cap_aniso = ae ? (float)atof(ae) : (g_vk.props.vendorID == 0x13B5 ? 1.0f : 16.0f);
+    }
+    float aniso = fminf(d->max_aniso, cap_aniso);
+    if (aniso > 1.0f) { si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = aniso; }
     static float lodmin = -1;
     if (lodmin < 0) lodmin = getenv("LARECOMP_LOD_MIN") ? (float)atof(getenv("LARECOMP_LOD_MIN")) : 0;
     if (lodmin > 0 && mf > 1) si.minLod = fmaxf(si.minLod, lodmin);

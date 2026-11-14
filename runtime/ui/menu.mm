@@ -712,28 +712,28 @@ static void tab_display(void) {
         if (opt_choice("Upscaler", &ui, ups, NUP, UP_DEFAULT, ud)) g_settings.upscaler = up_mode[ui];
     }
     {   // the final image's lines (nvn/output_scale.c): the screen's, or fewer, scaled up to it when presented
-        static const char *outs[] = {"Auto", "Screen", "1080p", "900p", "720p"};
-        static const int out_lines[] = {OUT_AUTO, 0, 1080, 900, 720};
+        static const char *outs[] = {"Auto", "Screen", "1080p", "900p", "720p", "540p"};
+        static const int out_lines[] = {OUT_AUTO, 0, 1080, 900, 720, 540};
         int oi = 1;
-        for (int i = 0; i < 5; i++) if (out_lines[i] == g_settings.out_lines) oi = i;
+        for (int i = 0; i < 6; i++) if (out_lines[i] == g_settings.out_lines) oi = i;
         float ox, oy;
         renderer_get_scale(&ox, &oy);
         char od[1280];
         int on = snprintf(od, sizeof od, tr("How many pixels the final image has - the 3D scene once scaled up, and the HUD - before "
-                                   "it reaches the screen. Screen: your screen's own, the sharpest. 1080p / 900p / 720p: "
+                                   "it reaches the screen. Screen: your screen's own, the sharpest. 1080p / 900p / 720p / 540p: "
                                    "fewer, scaled up at the very end: the game's last passes and the upscaler cost less "
                                    "(most on big and wide screens), the HUD and text are a little softer. Match display "
                                    "(Internal resolution) follows it.\n\nThe final image is %.0f x %.0f."),
                  1920.0 * ox, 1080.0 * oy);
         if (on > 0 && on < (int)sizeof od)
-            snprintf(od + on, sizeof od - on, "\n\n%s", tr("Auto: 1080p on screens with more lines than that, where it costs the "
-                                                           "GPU the most; the screen's own on the others."));
+            snprintf(od + on, sizeof od - on, "\n\n%s", tr("Auto: 1080p on screens with more lines than that (720p on entry Mali GPUs), "
+                                                           "where it costs the GPU the most; the screen's own on the others."));
 #ifdef __ANDROID__
         enum { OUT_DEFAULT = 0 };  // (Auto: settings.c)
 #else
         enum { OUT_DEFAULT = 1 };
 #endif
-        if (opt_choice("Output resolution", &oi, outs, 5, OUT_DEFAULT, od, false)) g_settings.out_lines = out_lines[oi];
+        if (opt_choice("Output resolution", &oi, outs, 6, OUT_DEFAULT, od, false)) g_settings.out_lines = out_lines[oi];
     }
     static const char *aa[] = {"Off", "SMAA", "FXAA"};
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 3, AA_OFF,
