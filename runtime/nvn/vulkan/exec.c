@@ -1340,31 +1340,98 @@ static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t al
     return s;
 }
 
-// Guest memory copied once per submission: draws binding the same range share the copy.
+// Guest memory copied once per chunk / command list: draws binding the same range share the copy.
 #define GCOPY_TAB 4096
 static struct { uint64_t addr, size, seq; VkSpan span; } gcopy[GCOPY_TAB];
 static uint16_t gcopy_active[GCOPY_TAB];
 static int gcopy_nactive;
 static uint64_t gcopy_active_seq;
-static uint64_t gcopy_gen;  // bumped to drop every shared copy (guest memory written mid-list)
-static void guest_copy_flush(void) { gcopy_gen++; gcopy_nactive = 0; }
+static uint64_t gcopy_gen;  // bumped to drop every shared copy (command list boundary / buffer copy)
+static uint32_t gcopy_rr;
+#define GCOPY_BASE_TAB 64
+static struct { uint64_t addr, size, seq, win_lo, win_hi; VkSpan span; } gcopy_base[GCOPY_BASE_TAB];
+static uint8_t gcopy_base_active[GCOPY_BASE_TAB];
+static int gcopy_base_nactive;
+static uint64_t gcopy_base_active_seq;
+static uint32_t gcopy_base_rr;
+static void guest_copy_flush(void) {
+    gcopy_gen++;
+    gcopy_nactive = 0;
+    gcopy_base_nactive = 0;
+}
 static void guest_copy_invalidate(uint64_t lo, uint64_t hi) {
-    uint64_t seq = vk_pending_seq() + (gcopy_gen << 40);
-    if (gcopy_active_seq != seq) return;
-    for (int i = 0; i < gcopy_nactive; i++) {
-        uint16_t s = gcopy_active[i];
-        if (gcopy[s].seq == seq && gcopy[s].addr < hi && lo < gcopy[s].addr + gcopy[s].size) gcopy[s].seq = 0;
+    uint64_t seq = (active >= 0 ? chunk_epoch : 0) + (gcopy_gen << 40);
+    if (gcopy_active_seq == seq) {
+        for (int i = 0; i < gcopy_nactive; i++) {
+            uint16_t s = gcopy_active[i];
+            if (gcopy[s].seq == seq && gcopy[s].addr < hi && lo < gcopy[s].addr + gcopy[s].size) gcopy[s].seq = 0;
+        }
+    }
+    if (gcopy_base_active_seq == seq) {
+        for (int i = 0; i < gcopy_base_nactive; i++) {
+            uint8_t s = gcopy_base_active[i];
+            // Updates inside [win_lo, win_hi) are supplied per draw via cbw_patch, so the base UBO snapshot stays valid.
+            if (gcopy_base[s].seq == seq && gcopy_base[s].addr < hi && lo < gcopy_base[s].addr + gcopy_base[s].size &&
+                !(lo >= gcopy_base[s].win_lo && hi <= gcopy_base[s].win_hi))
+                gcopy_base[s].seq = 0;
+        }
     }
 }
 static VkSpan guest_copy(uint64_t addr, uint64_t size) {
-    uint64_t seq = vk_pending_seq() + (gcopy_gen << 40), h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
+    uint64_t seq = chunk_epoch + (gcopy_gen << 40), h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
     if (gcopy_active_seq != seq) { gcopy_active_seq = seq; gcopy_nactive = 0; }
-    uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (GCOPY_TAB - 1);
-    if (gcopy[slot].seq == seq && gcopy[slot].addr == addr && gcopy[slot].size == size) return gcopy[slot].span;
-    if (gcopy[slot].seq != seq && gcopy_nactive < GCOPY_TAB) gcopy_active[gcopy_nactive++] = (uint16_t)slot;
+    uint32_t base = (uint32_t)(h ^ (h >> 32)) & (GCOPY_TAB - 1);
+    int free_slot = -1;
+    for (int w = 0; w < 4; w++) {
+        uint32_t idx = (base + (uint32_t)w) & (GCOPY_TAB - 1);
+        if (gcopy[idx].seq == seq) {
+            if (gcopy[idx].addr == addr && gcopy[idx].size == size &&
+                active >= 0 && gcopy[idx].span.buf == chunks[active].buf) {
+                chunks[active].seq = vk_pending_seq();
+                chunks[active].frame = renderer_present_count();
+                return gcopy[idx].span;
+            }
+        } else if (free_slot < 0) {
+            free_slot = (int)idx;
+        }
+    }
+    uint32_t slot = free_slot >= 0 ? (uint32_t)free_slot : ((base + (gcopy_rr++ & 3u)) & (GCOPY_TAB - 1));
     VkSpan s = vk_transient_copy((const void *)(uintptr_t)addr, size, 256);
     stat_cb_copied += size;
+    seq = chunk_epoch + (gcopy_gen << 40);
+    if (gcopy_active_seq != seq) { gcopy_active_seq = seq; gcopy_nactive = 0; }
+    if (gcopy[slot].seq != seq && gcopy_nactive < GCOPY_TAB) gcopy_active[gcopy_nactive++] = (uint16_t)slot;
     gcopy[slot].addr = addr; gcopy[slot].size = size; gcopy[slot].seq = seq; gcopy[slot].span = s;
+    return s;
+}
+static VkSpan guest_copy_base(uint64_t addr, uint64_t size, uint64_t win_lo, uint64_t win_hi) {
+    uint64_t seq = chunk_epoch + (gcopy_gen << 40), h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
+    if (gcopy_base_active_seq != seq) { gcopy_base_active_seq = seq; gcopy_base_nactive = 0; }
+    uint32_t base = (uint32_t)(h ^ (h >> 32)) & (GCOPY_BASE_TAB - 1);
+    int free_slot = -1;
+    for (int w = 0; w < 8; w++) {
+        uint32_t idx = (base + (uint32_t)w) & (GCOPY_BASE_TAB - 1);
+        if (gcopy_base[idx].seq == seq) {
+            if (gcopy_base[idx].addr == addr && gcopy_base[idx].size == size &&
+                gcopy_base[idx].win_lo == win_lo && gcopy_base[idx].win_hi == win_hi &&
+                active >= 0 && gcopy_base[idx].span.buf == chunks[active].buf) {
+                chunks[active].seq = vk_pending_seq();
+                chunks[active].frame = renderer_present_count();
+                return gcopy_base[idx].span;
+            }
+        } else if (free_slot < 0) {
+            free_slot = (int)idx;
+        }
+    }
+    uint32_t slot = free_slot >= 0 ? (uint32_t)free_slot : ((base + (gcopy_base_rr++ & 7u)) & (GCOPY_BASE_TAB - 1));
+    VkSpan s = vk_transient_copy((const void *)(uintptr_t)addr, size, 256);
+    stat_cb_copied += size;
+    seq = chunk_epoch + (gcopy_gen << 40);
+    if (gcopy_base_active_seq != seq) { gcopy_base_active_seq = seq; gcopy_base_nactive = 0; }
+    if (gcopy_base[slot].seq != seq && gcopy_base_nactive < GCOPY_BASE_TAB)
+        gcopy_base_active[gcopy_base_nactive++] = (uint8_t)slot;
+    gcopy_base[slot].addr = addr; gcopy_base[slot].size = size; gcopy_base[slot].seq = seq;
+    gcopy_base[slot].win_lo = win_lo; gcopy_base[slot].win_hi = win_hi; gcopy_base[slot].span = s;
     return s;
 }
 
@@ -2213,8 +2280,8 @@ static void begin_pass(void) {
             // GPU time and stayed at 30 even indoors; a whole frame at once, it chose 60 there)
             extern bool vk_driver_is_qualcomm(void);
             const char *e = getenv("LARECOMP_VK_CHUNK_US");
-            // Disable mid-frame chunk flushes on Qualcomm and Mali TBDR (matches split_long_pass).
-            chunk = e ? atol(e) : (vk_driver_is_qualcomm() || g_vk.props.vendorID == 0x13B5) ? 0 : 2000;
+            // Overlap Mali TBDR execution with CPU command translation at pass boundaries without splitting passes.
+            chunk = e ? atol(e) : vk_driver_is_qualcomm() ? 0 : g_vk.props.vendorID == 0x13B5 ? 4000 : 2000;
         }
         extern int vk_ab(const char *what);
         long ch = chunk > 0 && AB("chunk") == 1 ? 500 : chunk;
@@ -3001,20 +3068,27 @@ static void translate_program(void *arg) {
 
 static VkObjectCache prog_cache;
 static _Atomic size_t program_keys;
+static uint32_t mru_epoch;
+RT_ON_RESET(exec_mru_reset) { mru_epoch++; }
 
 static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
-    // (the previous draw's program and keys again - most draws: no hashing; the code addresses are part of it, as
-    // the program object can be reused for other code)
-    static NvnProgram *last_np;
-    static uint64_t last_code[2];
-    static ShaderKey last_vkey, last_fkey;
-    static Prog *last_prog;
-    if (last_prog && np == last_np && last_code[0] == np->stages[0].code_addr && last_code[1] == np->stages[1].code_addr &&
-        !memcmp(vkey, &last_vkey, sizeof *vkey) && !memcmp(fkey, &last_fkey, sizeof *fkey))
-        return last_prog;
-    last_np = np, last_code[0] = np->stages[0].code_addr, last_code[1] = np->stages[1].code_addr;
-    last_vkey = *vkey, last_fkey = *fkey;
+    // Small MRU cache avoids repeated 8-byte key hashing and hash-table probing when alternating shaders in a pass.
+    static struct {
+        NvnProgram *np;
+        uint64_t code[2];
+        ShaderKey vkey, fkey;
+        Prog *prog;
+        uint32_t epoch;
+    } mru[4];
+    static int mru_next;
+    uint32_t ep = mru_epoch;
+    uint64_t c0 = np->stages[0].code_addr, c1 = np->stages[1].code_addr;
+    for (int i = 0; i < 4; i++) {
+        if (mru[i].epoch == ep && mru[i].prog && mru[i].np == np && mru[i].code[0] == c0 && mru[i].code[1] == c1 &&
+            !memcmp(vkey, &mru[i].vkey, sizeof *vkey) && !memcmp(fkey, &mru[i].fkey, sizeof *fkey))
+            return mru[i].prog;
+    }
     uint64_t h = 0xcbf29ce484222325ull;
     for (int i = 0; i < 2; i++) { uint64_t a = np->stages[i].code_addr; for (int k = 0; k < 8; k++) { h ^= (a >> (k * 8)) & 0xFF; h *= 0x100000001B3ull; } }
     h = hash_words(h, vkey, sizeof *vkey);  // (8 bytes a step: the table is in memory only)
@@ -3024,19 +3098,29 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
 #endif
     if (!h) h = 1;
     VkObjectEntry *entry = vk_object_slot(&prog_cache, h);
-    if (entry->object) return last_prog = entry->object;
-    atomic_store(&program_keys, prog_cache.count);
-    Prog *p = calloc(1, sizeof *p);
-    last_prog = p;
-    entry->object = p;
-    for (int i = 0; i < 2; i++) {
-        p->code[i] = np->stages[i].code_addr;
-        p->cmax[i] = np->stages[i].const_offset ? np->stages[i].const_offset : 0x10000;
-        p->const_bytes[i] = np->stages[i].const_offset ? np->stages[i].const_size : 0;
+    Prog *p = entry->object;
+    if (!p) {
+        atomic_store(&program_keys, prog_cache.count);
+        p = calloc(1, sizeof *p);
+        entry->object = p;
+        for (int i = 0; i < 2; i++) {
+            p->code[i] = np->stages[i].code_addr;
+            p->cmax[i] = np->stages[i].const_offset ? np->stages[i].const_offset : 0x10000;
+            p->const_bytes[i] = np->stages[i].const_offset ? np->stages[i].const_size : 0;
+        }
+        p->vkey = *vkey;
+        p->fkey = *fkey;
+        run_translate(translate_program, p);
     }
-    p->vkey = *vkey;
-    p->fkey = *fkey;
-    run_translate(translate_program, p);
+    int slot = mru_next;
+    mru_next = (mru_next + 1) & 3;
+    mru[slot].np = np;
+    mru[slot].code[0] = c0;
+    mru[slot].code[1] = c1;
+    mru[slot].vkey = *vkey;
+    mru[slot].fkey = *fkey;
+    mru[slot].prog = p;
+    mru[slot].epoch = ep;
     return p;
 }
 
@@ -3517,8 +3601,12 @@ static bool snap_fb_dirty[8];
 static const char *snap_why[8];
 static const char *snap_reason = "?";
 static void snapshots_invalidate(NvnTexture *t) {
-    for (int i = 0; i < 8; i++)
-        if ((!t || snap_tex[i] == t) && snap_ok[i]) { snap_ok[i] = false; snap_fb_dirty[i] = false; snap_why[i] = snap_reason; }
+    uint64_t taddr = t ? t->addr : 0;
+    for (int i = 0; i < 8; i++) {
+        if (!snap_ok[i]) continue;
+        bool match = !t || snap_tex[i] == t || (taddr && snap_tex[i] && snap_tex[i]->addr == taddr);
+        if (match) { snap_ok[i] = false; snap_fb_dirty[i] = false; snap_why[i] = snap_reason; }
+    }
 }
 static void snapshots_mark_fb_dirty(NvnTexture *t) {
     for (int i = 0; i < 8; i++) if (snap_tex[i] == t && snap_ok[i]) snap_fb_dirty[i] = true;
@@ -4506,8 +4594,12 @@ static bool ubo_direct(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out
 // rows there (the sync lag lets the CPU run a frame ahead). LARECOMP_CB_WINDOW=1: on (a test).
 static bool cbwin_wanted(void) {
     static int on = -1;
-    if (on < 0) on = getenv("LARECOMP_CB_WINDOW") && atoi(getenv("LARECOMP_CB_WINDOW"));
-    return on && gmem_placed;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_CB_WINDOW");
+        // In copy mode (!gmem_placed), cbwin is race-free (backed by transient snapshots) and eliminates 64 KB UBO re-copies.
+        on = e ? atoi(e) != 0 : !gmem_placed;
+    }
+    return on;
 }
 // (the update marks are guest addresses: a reboot's game puts other things there)
 RT_ON_RESET(ubo_inline_reset) {
@@ -4545,20 +4637,29 @@ static uint64_t cbwin_rows(uint64_t addr, uint64_t size) {
 }
 
 static bool cbwin_bind(int stage, int k, uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
-    if ((stage != 0 && stage != 1) || !gmem_placed || cbw_patch[stage].m[0] || AB("cbwin") == 1) return false;
-    if (addr < HEAP_BASE || addr + size > HEAP_BASE + gmem_size) return false;
-    uint64_t off = addr - HEAP_BASE;
-    if ((off & (g_vk.props.limits.minUniformBufferOffsetAlignment - 1)) || size > g_vk.props.limits.maxUniformBufferRange ||
-        off > 0xFFFFFFFFull)
+    if ((stage != 0 && stage != 1) || cbw_patch[stage].m[0] || AB("cbwin") == 1) return false;
+    if (gmem_placed) {
+        if (addr < HEAP_BASE || addr + size > HEAP_BASE + gmem_size) return false;
+        uint64_t off = addr - HEAP_BASE;
+        if ((off & (g_vk.props.limits.minUniformBufferOffsetAlignment - 1)) || size > g_vk.props.limits.maxUniformBufferRange ||
+            off > 0xFFFFFFFFull)
+            return false;
+    } else if (size <= sizeof cbw_patch[0]) {
         return false;
+    }
     uint64_t rows = cbwin_rows(addr, size), first = rows & ((1ull << 48) - 1), n = (rows >> 48) + 1;
     if (!rows) return false;
+    if (gmem_placed) {
+        *out = (VkDescriptorBufferInfo){gmem_buf, addr - HEAP_BASE, size};
+    } else {
+        VkSpan base = guest_copy_base(addr, size, first, first + n * 16);
+        *out = ubo_span(base, size);
+    }
     memcpy(cbw_patch[stage].rows, (const void *)(uintptr_t)first, n * 16);
     cbw_patch[stage].m[0] = (uint32_t)k + 1;
     cbw_patch[stage].m[1] = (uint32_t)((first - addr) >> 4);
     cbw_patch[stage].m[2] = (uint32_t)n;
     stat_cbwin++;
-    *out = (VkDescriptorBufferInfo){gmem_buf, off, size};
     return true;
 }
 static bool gmem_placed_(void) { return gmem_placed; }
@@ -7148,20 +7249,46 @@ static void draw_(CmdRec *r, bool indexed) {
         k.poly_fill = st.poly[2] != 1;
         k.depth_clamp = st.depth_clamp;
 #ifdef __ANDROID__
-        // (consecutive draws mostly share their pipeline: a compare instead of the serial hash of the ~700-byte key)
-        static PipeKey last_k;
-        static uint64_t last_ph;
-        uint64_t ph;
-        if (last_ph && !memcmp(&k, &last_k, sizeof k)) ph = last_ph;
-        else {
-            ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
-            if (!ph) ph = 1;
-            last_k = k, last_ph = ph;
+        // Small MRU avoids re-hashing ~700-byte keys and probing pipe_cache when alternating pipelines in a pass.
+        static struct { PipeKey k; uint64_t ph; Pipe *pp; uint32_t epoch; } pipe_mru[4];
+        static int pipe_mru_next;
+        uint32_t pep = mru_epoch;
+        uint64_t ph = 0;
+        pp = NULL;
+        for (int i = 0; i < 4; i++) {
+            if (pipe_mru[i].epoch == pep && pipe_mru[i].ph && !memcmp(&k, &pipe_mru[i].k, sizeof k)) {
+                ph = pipe_mru[i].ph;
+                if (!verify && pipe_mru[i].pp && !pipe_mru[i].pp->evicted) pp = pipe_mru[i].pp;
+                break;
+            }
+        }
+        if (!pp) {
+            if (!ph) {
+                ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
+                if (!ph) ph = 1;
+            }
+            VkObjectEntry *entry = vk_object_slot(&pipe_cache, ph);
+            pp = entry->object;
+            if (!pp) {
+                atomic_store(&pipeline_keys, pipe_cache.count);
+                pp = calloc(1, sizeof *pp);
+                pp->k = k;
+                entry->object = pp;
+                run_job(build_pipeline, pp);
+            } else if (pp->evicted) {  // (destroyed by pipe_evict: built again)
+                pp->evicted = false;
+                run_job(build_pipeline, pp);
+            }
+            int slot = pipe_mru_next;
+            pipe_mru_next = (pipe_mru_next + 1) & 3;
+            pipe_mru[slot].k = k;
+            pipe_mru[slot].ph = ph;
+            pipe_mru[slot].pp = pp;
+            pipe_mru[slot].epoch = pep;
         }
 #else
         uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
         if (!ph) ph = 1;
-#endif
         VkObjectEntry *entry = vk_object_slot(&pipe_cache, ph);
         pp = entry->object;
         if (!pp) {
@@ -7174,6 +7301,7 @@ static void draw_(CmdRec *r, bool indexed) {
             pp->evicted = false;
             run_job(build_pipeline, pp);
         }
+#endif
         // Verification rebuilds the original key to detect missing invalidations during later device tests.
         if (hit && memcmp(&k, &last_pipeline->k, sizeof k)) {
             LOG("[vk] pipeline reuse: stale key detected\n");
@@ -7695,7 +7823,6 @@ static void copy_region_dims(NvnTexture *t, const TexRefRec *ref, const FormatIn
 }
 
 static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
-    snap_reason = "buf2tex"; snapshots_invalidate(NULL);
     NvnTexture *t = (NvnTexture *)(uintptr_t)dst->tex;
     {   extern uint64_t nvn_watch_texaddr(void);
         uint64_t wa = nvn_watch_texaddr();
@@ -7705,6 +7832,7 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
                 dst->region[3], dst->region[4], dst->region[5]);
     }
     if (!t || !src) return;
+    snap_reason = "buf2tex"; snapshots_invalidate(t);
     alias_before_write(t, 0, "upload");
     vk_end_pass();
     const FormatInfo *fi;
@@ -7842,9 +7970,9 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
                 ws ? ws->width : 0, ws ? ws->height : 0, ws ? ws->format : 0, ws ? (unsigned long long)ws->addr : 0ull,
                 wd ? wd->width : 0, wd ? wd->height : 0, wd ? wd->format : 0, wd ? (unsigned long long)wd->addr : 0ull);
     }
-    snap_reason = "tex2tex"; snapshots_invalidate(NULL);
     NvnTexture *st_ = (NvnTexture *)(uintptr_t)src->tex, *dt = (NvnTexture *)(uintptr_t)dst->tex;
     if (!st_ || !dt) return;
+    snap_reason = "tex2tex"; snapshots_invalidate(dt);
     vk_end_pass();
 #ifdef __ANDROID__
     vk_bc_shadows_resolve(NULL, NULL, NULL, 0);
@@ -8555,8 +8683,10 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_SET_DEPTH_CLAMP: pipeline_dirty |= st.depth_clamp != (r->x[0] != 0); st.depth_clamp = r->x[0] != 0; break;
         case CMD_SET_COPY_STRIDES: st.copy_row_stride = r->x[0]; st.copy_image_stride = r->x[1]; break;
         case CMD_CLEAR_COLOR: {
-            snap_reason = "clear-color"; snapshots_invalidate(NULL);
             int index = (int)r->x[0];
+            if (index >= 0 && index < st.rt.ncolor && st.rt.color[index]) {
+                snap_reason = "clear-color"; snapshots_invalidate(st.rt.color[index]);
+            }
             static long clears_from = -1;  // (LARECOMP_LOG_CLEARS=<from frame>)
             if (clears_from < 0) clears_from = getenv("LARECOMP_LOG_CLEARS") ? atol(getenv("LARECOMP_LOG_CLEARS")) : 0x7fffffffL;
             if ((long)renderer_present_count() >= clears_from && index < st.rt.ncolor && st.rt.color[index]) {
@@ -8577,7 +8707,7 @@ static void exec_list(uint64_t handle, int depth) {
             const struct { uint64_t tex; NvnTextureView view; uint8_t has_view; int32_t region[6]; float color[4]; } *ct = x;
             NvnTexture *t = (NvnTexture *)(uintptr_t)ct->tex;
             if (!t) break;
-            snap_reason = "clear-texture"; snapshots_invalidate(NULL);
+            snap_reason = "clear-texture"; snapshots_invalidate(t);
             alias_before_write(t, 0, "clear");
             RtState saved = st.rt;
             int32_t sc[4];
@@ -8599,7 +8729,7 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         }
         case CMD_CLEAR_DEPTH_STENCIL:
-            snap_reason = "clear-depth"; snapshots_invalidate(NULL);
+            if (st.rt.depth) { snap_reason = "clear-depth"; snapshots_invalidate(st.rt.depth); }
             if (ct_on() && st.rt.depth)
                 LOG("[ct] clear-depth %p d%d s%d sc %d %d %d %d\n", (void *)st.rt.depth, r->x[0] != 0, r->x[2] != 0, st.scissor[0][0],
                     st.scissor[0][1], st.scissor[0][2], st.scissor[0][3]);
@@ -8742,6 +8872,7 @@ static void exec_list(uint64_t handle, int depth) {
             }
             renderer_flush();
             memmove((void *)(uintptr_t)r->x[1], (void *)(uintptr_t)r->x[0], r->x[2]);
+            guest_copy_flush();
             break;
         default: break;
         }
@@ -8770,6 +8901,7 @@ void backend_execute(uint64_t handle) {
     if (log_lists < 0) log_lists = getenv("LARECOMP_LOG_LISTS") != NULL;
     uint64_t ll_d = stat_draws, ll_p = stat_passes, ll_t = log_lists ? plat_now_ns() : 0;
     exec_list(handle, 0);
+    guest_copy_flush();
     if (log_lists && renderer_present_count() % 120 == 0)
         LOG("[lists] frame %llu: list %llx %llu draws %llu passes %.2f ms\n", (unsigned long long)renderer_present_count(),
             (unsigned long long)handle, (unsigned long long)(stat_draws - ll_d), (unsigned long long)(stat_passes - ll_p),

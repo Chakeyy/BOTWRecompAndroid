@@ -189,7 +189,7 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
         }
         g_guest_lo = base;
         fprintf(stderr, "[android] guest window %#llx-%#llx\n", (unsigned long long)base, (unsigned long long)(base + hi - lo));
-        fprintf(stderr, "[BOTW-Opt r02] Helio G99 / Mali-G57 Optimization Suite Active\n");
+        fprintf(stderr, "[BOTW-Opt r04] Helio G99 / Mali-G57 Optimization Suite Active\n");
         const char *last = getenv("LARECOMP_LAST_EXIT");  // (the activity: ApplicationExitInfo)
         if (last && *last) fprintf(stderr, "[android] the last run ended: %s\n", last);
         const char *boot = getenv("LARECOMP_BOOT_STATE");
@@ -463,7 +463,26 @@ void plat_thread_realtime(uint64_t period_ns) {
 }
 
 // ---- process
-void plat_init(void) { log_to_logcat(); }
+#ifndef M_BIONIC_ZERO_INIT
+#define M_BIONIC_ZERO_INIT -4
+#endif
+#ifndef M_DECAY_TIME
+#define M_DECAY_TIME -100
+#endif
+#ifndef M_CACHE_COUNT_MAX
+#define M_CACHE_COUNT_MAX -200
+#endif
+#ifndef M_CACHE_SIZE_MAX
+#define M_CACHE_SIZE_MAX -201
+#endif
+
+void plat_init(void) {
+    log_to_logcat();
+    mallopt(M_BIONIC_ZERO_INIT, 1);
+    mallopt(M_DECAY_TIME, 1);
+    mallopt(M_CACHE_COUNT_MAX, 256);
+    mallopt(M_CACHE_SIZE_MAX, 16 << 20);
+}
 
 // "The executable": a file in the folder the app copies its shipped resources to (internal storage, files/res: the
 // Baloo font, the icon, ...), so runtime/paths.c finds them next to it as on the desktop. Native libraries stay in
@@ -931,13 +950,16 @@ void plat_render_thread_pin(void) {
 }
 
 void plat_thread_unpin(void) {
+    mallopt(M_BIONIC_ZERO_INIT, 1);
     if (g_pinned) sched_setaffinity(0, sizeof g_all_cores, &g_all_cores);
     uclamp_min_thread();
 }
 
-void plat_worker_thread_pin(void) {
-    const char *e = getenv("LARECOMP_WORKER_LITTLE");
-    if (e && !atoi(e)) return;
+static pthread_once_t g_little_once = PTHREAD_ONCE_INIT;
+static cpu_set_t g_little_set;
+static bool g_have_little;
+
+static void init_little_cores(void) {
     long best = 0, mhz[64] = {0};
     int n = 0;
     for (int c = 0; c < 64; c++) {
@@ -950,15 +972,22 @@ void plat_worker_thread_pin(void) {
         if (mhz[c] > best) best = mhz[c];
         n = c + 1;
     }
-    cpu_set_t set;
-    CPU_ZERO(&set);
+    CPU_ZERO(&g_little_set);
     int k = 0;
     for (int c = 0; c < n; c++)
         if (mhz[c] > 0 && mhz[c] < best) {
-            CPU_SET(c, &set);
+            CPU_SET(c, &g_little_set);
             k++;
         }
-    if (best && k > 0) sched_setaffinity(0, sizeof set, &set);
+    g_have_little = best && k > 0;
+}
+
+void plat_worker_thread_pin(void) {
+    mallopt(M_BIONIC_ZERO_INIT, 1);
+    const char *e = getenv("LARECOMP_WORKER_LITTLE");
+    if (e && !atoi(e)) return;
+    pthread_once(&g_little_once, init_little_cores);
+    if (g_have_little) sched_setaffinity(0, sizeof g_little_set, &g_little_set);
     setpriority(PRIO_PROCESS, 0, 10);
 }
 
