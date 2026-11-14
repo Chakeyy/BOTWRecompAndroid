@@ -795,10 +795,9 @@ static uint64_t full_hash_budget, full_hash_budget_frame;
 static bool tex_periodic(void) {
     static int on = -1;
     if (on < 0) {
-        extern bool vk_low_ram(void);
         const char *e = getenv("LARECOMP_TEX_PERIODIC");
-        on = e ? atoi(e) != 0 : !vk_low_ram();
-        if (!on) LOG("[vk] textures: no periodic full hash of unwritten ones (low RAM)\n");
+        on = e ? atoi(e) != 0 : false;
+        if (!on) LOG("[vk] textures: no periodic full hash of unwritten write-tracked ones\n");
     }
     return on;
 }

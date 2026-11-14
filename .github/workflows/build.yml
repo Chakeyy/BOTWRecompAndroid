@@ -49,7 +49,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: android/deps/out
-          key: botw-prebuilt-deps-v0.4.0-beta-v3
+          key: botw-prebuilt-deps-native-v0.4.0-beta-v1
 
       - name: Populate android/deps/out from upstream APK and header tarballs
         if: steps.deps-cache.outputs.cache-hit != 'true'
@@ -60,23 +60,15 @@ jobs:
           SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           TC="$SDK/ndk/$ANDROID_NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin"
           rm -rf "$WORK" "$OUT"
-          mkdir -p "$WORK" "$OUT"/{include/vma,lib,volk,fonts,java/org/libsdl,gen/zig/lib,gen/python/lib,gen/lib,gen/site}
+          mkdir -p "$WORK" "$OUT"/{include/vma,lib,volk,fonts,java/org/libsdl}
 
-          # 1. Extract prebuilt .so libraries, font, and gen/ runtime assets from upstream v0.4.0-beta APK
+          # 1. Extract core runtime .so libraries and font from upstream v0.4.0-beta APK (native-only lean APK: omit AOT gen/ toolchain)
           curl -fsSL -o "$WORK/upstream.apk" "https://github.com/mamcjr/BOTWRecompAndroid/releases/download/v0.4.0-beta/BOTWRecompAndroid-0.4.0-beta.apk"
           unzip -q "$WORK/upstream.apk" -d "$WORK/apk"
           for l in libSDL3.so libshaderc_shared.so libavcodec.so libavformat.so libavutil.so libswscale.so; do
             cp "$WORK/apk/lib/arm64-v8a/$l" "$OUT/lib/"
           done
-          cp "$WORK/apk/lib/arm64-v8a/libzig.so" "$OUT/gen/zig/"
-          cp "$WORK/apk/lib/arm64-v8a/libpymain.so" "$WORK/apk/lib/arm64-v8a/libpython3.14.so" "$OUT/gen/python/"
-          for l in libcapstone.so libunicorn.so liblz4.so; do
-            cp "$WORK/apk/lib/arm64-v8a/$l" "$OUT/gen/lib/"
-          done
           cp "$WORK/apk/assets/res/DejaVuSans.ttf" "$OUT/fonts/"
-          cp -r "$WORK/apk/assets/gen/python/lib/." "$OUT/gen/python/lib/"
-          cp -r "$WORK/apk/assets/gen/site/." "$OUT/gen/site/"
-          cp -r "$WORK/apk/assets/gen/zig/lib/." "$OUT/gen/zig/lib/"
 
           # 2. Download & unpack upstream headers and SDL3 Java glue
           fetch() {
@@ -145,8 +137,8 @@ jobs:
             exit 1
           fi
           mkdir -p "$RUNNER_TEMP/out_apk"
-          cp "$APK_SRC" "$RUNNER_TEMP/out_apk/BOTWRecomp-r01-${SHORT_SHA}.apk"
-          echo "APK_ARTIFACT_NAME=BOTWRecomp-r01-${SHORT_SHA}" >> "$GITHUB_ENV"
+          cp "$APK_SRC" "$RUNNER_TEMP/out_apk/BOTWRecomp-r02-${SHORT_SHA}.apk"
+          echo "APK_ARTIFACT_NAME=BOTWRecomp-r02-${SHORT_SHA}" >> "$GITHUB_ENV"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4

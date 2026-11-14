@@ -68,7 +68,8 @@ Settings g_settings = {
 #endif
 #ifdef __ANDROID__
     .upscaler = UPSCALE_SGSR1,  // (one pass: ~1 ms on the Adreno 830 to 2560x1440, FSR 1's two ~2.7 ms; 40 fps against 38)
-    .native_code = false,       // (an experiment: runtime/native.c)
+    .native_code = true,        // (NCE default on ARM64 Android: runtime/native.c)
+    .files_in_place = true,     // (zero-copy RomFS default: read straight from picked dump folder)
     .sync_lag = true,           // (a few more fps; the CPU's reads of GPU results a frame old: nvn/objects.c nvnSyncWait)
     .out_lines = OUT_AUTO,      // (POCO F7 Ultra, 3200x1440, 1.8.2's Great Plateau: GPU 22.8 ms a frame at the screen's,
                                 // 18.6 at 1080 lines with a larger scene - the final image's passes over 2.2x the pixels)
@@ -368,6 +369,9 @@ void settings_load(void) {
     if (!aspect_key) g_settings.aspect_asked = true;  // (likewise: the aspect ratio was chosen already)
     if (g_settings.volume < 0) g_settings.volume = 0;
     if (g_settings.volume > 2) g_settings.volume = 2;
+#ifdef __ANDROID__
+    g_settings.native_code = true;  // (native-only APK build: always run in NCE Native Mode)
+#endif
     LOG("[settings] loaded %s\n", SETTINGS_FILE);
 }
 

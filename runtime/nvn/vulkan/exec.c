@@ -146,6 +146,10 @@ static pthread_cond_t sw_cv = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t sw_submitted;
 static void *seq_waiter(void *arg) {
     (void)arg;
+#ifdef __ANDROID__
+    extern void plat_worker_thread_pin(void);
+    plat_worker_thread_pin();
+#endif
     for (;;) {
         pthread_mutex_lock(&sw_m);
         uint64_t done;
@@ -164,9 +168,13 @@ static void *seq_waiter(void *arg) {
 }
 static bool seq_thread_on(void) {
     if (seq_thread < 0) {
-        extern bool vk_low_ram(void);
         const char *e = getenv("LARECOMP_SEQ_THREAD");
+#ifdef __ANDROID__
+        seq_thread = e ? atoi(e) != 0 : 1;
+#else
+        extern bool vk_low_ram(void);
         seq_thread = e ? atoi(e) != 0 : vk_low_ram();
+#endif
         if (seq_thread) {
             pthread_t th;
             if (pthread_create(&th, NULL, seq_waiter, NULL)) seq_thread = 0;
@@ -1185,6 +1193,7 @@ bool vk_low_ram(void) {
 typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t size, used, seq, frame; } Chunk;  // frame: last picked
 static Chunk *chunks;
 static int nchunks, active = -1;
+static uint64_t chunk_epoch = 1;
 
 static int new_chunk(uint64_t size) {
     chunks = realloc(chunks, (nchunks + 1) * sizeof *chunks);
@@ -1247,6 +1256,7 @@ VkSpan vk_transient(uint64_t size, uint64_t align) {
         if (i != active && chunks[i].seq <= done && chunks[i].size >= size) { pick = i; break; }
     if (pick < 0) pick = new_chunk(size > CHUNK_SIZE ? size : CHUNK_SIZE);
     active = pick;
+    chunk_epoch++;
     chunks[pick].used = size;
     chunks[pick].seq = pending;
     chunks[pick].frame = now;
@@ -1298,13 +1308,17 @@ enum { DEDUPE_RSCALE_V, DEDUPE_RSCALE_F, DEDUPE_TINT, DEDUPE_DRV_V, DEDUPE_DRV_F
 // driver is slow at writing descriptor sets (~4 ms a frame on them)
 static uint32_t gmap_tab[(GMAP_MAX + 1) * 4];
 static VkSpan gmap_copy(void) {
-    static struct { uint64_t seq; uint32_t tab[(GMAP_MAX + 1) * 4]; VkSpan span; } c[8];
+    static struct { uint64_t epoch; uint32_t tab[(GMAP_MAX + 1) * 4]; VkSpan span; } c[8];
     static int next;
-    uint64_t seq = vk_pending_seq();
     for (int i = 0; i < 8; i++)
-        if (c[i].seq == seq && !memcmp(c[i].tab, gmap_tab, sizeof c[i].tab)) return c[i].span;
+        if (active >= 0 && c[i].epoch == chunk_epoch && c[i].span.buf == chunks[active].buf &&
+            !memcmp(c[i].tab, gmap_tab, sizeof c[i].tab)) {
+            chunks[active].seq = vk_pending_seq();
+            chunks[active].frame = renderer_present_count();
+            return c[i].span;
+        }
     VkSpan sp = vk_transient_copy(gmap_tab, sizeof c[0].tab, 256);
-    c[next].seq = seq;
+    c[next].epoch = chunk_epoch;
     memcpy(c[next].tab, gmap_tab, sizeof c[next].tab);
     c[next].span = sp;
     next = (next + 1) % 8;
@@ -1313,12 +1327,16 @@ static VkSpan gmap_copy(void) {
 #endif
 
 static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t align) {
-    static struct { uint64_t seq, size; uint8_t data[0x800]; VkSpan span; } last[DEDUPE_SLOTS];
-    uint64_t seq = vk_pending_seq();
+    static struct { uint64_t epoch, size; uint8_t data[0x800]; VkSpan span; } last[DEDUPE_SLOTS];
     if (size > sizeof last[0].data) return vk_transient_copy(data, size, align);
-    if (last[slot].seq == seq && last[slot].size == size && !memcmp(last[slot].data, data, size)) return last[slot].span;
+    if (active >= 0 && last[slot].epoch == chunk_epoch && last[slot].span.buf == chunks[active].buf &&
+        last[slot].size == size && !memcmp(last[slot].data, data, size)) {
+        chunks[active].seq = vk_pending_seq();
+        chunks[active].frame = renderer_present_count();
+        return last[slot].span;
+    }
     VkSpan s = vk_transient_copy(data, size, align);
-    last[slot].seq = seq; last[slot].size = size; memcpy(last[slot].data, data, size); last[slot].span = s;
+    last[slot].epoch = chunk_epoch; last[slot].size = size; memcpy(last[slot].data, data, size); last[slot].span = s;
     return s;
 }
 
@@ -2710,11 +2728,11 @@ static void descriptor_plan(const VkBindingInfo *binds, int count, uint32_t set,
     for (int i = 0; i < count; i++) {
         const VkBindingInfo *b = &binds[i];
         if (b->set != set) continue;
+        bool ubo = b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         if ((b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b->binding >= 32) ||
-            (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding < 17) || b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+            (ubo && b->binding < 17) || b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
             plan->regular[plan->nregular++] = (uint8_t)i;
-        else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
-                 (b->binding == 18 || b->binding == 19 || b->binding == GMAP_BUFFER_INDEX || b->binding == CBPATCH_BUFFER_INDEX))
+        else if (ubo && (b->binding == 18 || b->binding == 19 || b->binding == GMAP_BUFFER_INDEX || b->binding == CBPATCH_BUFFER_INDEX))
             plan->deferred[plan->ndeferred++] = (uint8_t)i;
     }
 }
@@ -5957,6 +5975,7 @@ void vk_exec_reset(void) {
     free(compute_cache.entries);
     compute_cache = (VkObjectCache){0};
     gcopy_gen++;
+    chunk_epoch++;
     if (gmem_buf) {
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
         vkFreeMemory(g_vk.dev, gmem_mem, NULL);
@@ -5990,6 +6009,34 @@ void vk_exec_reset(void) {
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
     ShaderTexture *st_ = &si->tex[i];
     uint64_t h = shader_texture_handle(stage, st_);
+    extern uint32_t vk_view_gen, tex_slot_gen;
+    extern uint64_t vk_frame_counter(void);
+    static int nomemo = -1;
+    if (nomemo < 0) nomemo = getenv("LARECOMP_VK_NO_TEX_MEMO") != NULL;
+    uint64_t frame = vk_frame_counter();
+    typedef struct {
+        NvnDescPool *tpool, *spool;
+        uint64_t handle, frame;
+        uint32_t vgen, sgen;
+        uint8_t flags;
+        VkDescriptorImageInfo info;
+        float sc[2];
+        uint32_t wh[2];
+    } TexFullMemo;
+    static TexFullMemo full_memo[4096];
+    uint8_t mflags = (uint8_t)st_->type | (st_->shadow ? 0x40u : 0u) | (stage == 0 ? 0x80u : 0u);
+    uint32_t fslot = (uint32_t)(((h * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)mflags * 0xC2B2AE3D27D4EB4Full)) >> 32) & 4095u;
+    bool can_full_memo = !nomemo && !naliases && !nfeedback && !scene_up.t && h && st.tpool && st.spool;
+    if (can_full_memo) {
+        TexFullMemo *fm = &full_memo[fslot];
+        if (fm->handle == h && fm->frame == frame && fm->tpool == st.tpool && fm->spool == st.spool &&
+            fm->vgen == vk_view_gen && fm->sgen == tex_slot_gen && fm->flags == mflags) {
+            *out = fm->info;
+            sc[0] = fm->sc[0]; sc[1] = fm->sc[1];
+            wh[0] = fm->wh[0]; wh[1] = fm->wh[1];
+            return;
+        }
+    }
     VkImageView view = VK_NULL_HANDLE;
     VkSampler smp = VK_NULL_HANDLE;
     uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
@@ -6002,12 +6049,8 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
             // Per-frame memo: ~2400 lookups per overworld frame recomputed the view (format / range math, cache
             // probe). The first lookup of a frame still runs vk_view (upload check); a view that may have been
             // destroyed (eviction, image re-created) bumps vk_view_gen. LARECOMP_VK_NO_TEX_MEMO=1 disables.
-            extern uint32_t vk_view_gen;
-            extern uint64_t vk_frame_counter(void);
-            static int nomemo = -1;
-            if (nomemo < 0) nomemo = getenv("LARECOMP_VK_NO_TEX_MEMO") != NULL;
             static struct { NvnTexture *tex; uint64_t vh, frame; uint32_t gen; uint8_t type, has_view; VkImageView view; } memo[1024];
-            uint64_t vh = e->has_view ? hash_words(0, &e->view, sizeof e->view) : 0, frame = vk_frame_counter();
+            uint64_t vh = e->has_view ? hash_words(0, &e->view, sizeof e->view) : 0;
             uint32_t ms = (uint32_t)((((uintptr_t)e->tex >> 4) ^ vh ^ (uint64_t)st_->type * 0x9E3779B97F4A7C15ull) & 1023);
             if (!nomemo && memo[ms].tex == e->tex && memo[ms].vh == vh && memo[ms].frame == frame && memo[ms].gen == vk_view_gen &&
                 memo[ms].type == st_->type && memo[ms].has_view == e->has_view) {
@@ -6078,6 +6121,16 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     if (!view) view = vk_dummy_view(st_->type);
     if (!smp) smp = vk_default_sampler(true);
     *out = (VkDescriptorImageInfo){smp, view, VK_IMAGE_LAYOUT_GENERAL};
+    if (can_full_memo) {
+        TexFullMemo *fm = &full_memo[fslot];
+        fm->tpool = st.tpool; fm->spool = st.spool;
+        fm->handle = h; fm->frame = frame;
+        fm->vgen = vk_view_gen; fm->sgen = tex_slot_gen;
+        fm->flags = mflags;
+        fm->info = *out;
+        fm->sc[0] = sc[0]; fm->sc[1] = sc[1];
+        fm->wh[0] = wh[0]; fm->wh[1] = wh[1];
+    }
 }
 
 // Writes the descriptor set of one stage. gx..gz: compute group counts (driver constants).
@@ -6105,7 +6158,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     static int planned = -1;
     if (planned < 0) {
         const char *e = getenv("LARECOMP_VK_DESCRIPTOR_PLAN");
-        planned = e && atoi(e) != 0;  // experimental: keep the measured stable path as the default
+        planned = !e || atoi(e) != 0;
     }
     const DescriptorPlan *plan = &p->descriptor_plans[set];
 #endif
@@ -8348,10 +8401,10 @@ int vk_ab(const char *what) {
 static void split_long_pass(void) {
 #ifdef __ANDROID__
     static long split = -1;
-    if (split < 0) {  // (3 ms by default; not on Qualcomm's driver, as LARECOMP_VK_CHUNK_US)
+    if (split < 0) {  // (3 ms by default; not on Qualcomm or Mali TBDR, as LARECOMP_VK_CHUNK_US)
         extern bool vk_driver_is_qualcomm(void);
         const char *e = getenv("LARECOMP_VK_SPLIT_US");
-        split = e ? atol(e) : vk_driver_is_qualcomm() ? 0 : 3000;
+        split = e ? atol(e) : (vk_driver_is_qualcomm() || g_vk.props.vendorID == 0x13B5) ? 0 : 3000;
     }
     extern bool vk_async_on(void);
     static unsigned n;  // (the clock every 32 draws: a clock read per draw showed up in the profile)

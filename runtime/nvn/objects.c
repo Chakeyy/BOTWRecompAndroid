@@ -1234,10 +1234,12 @@ static void slot_retire_pending(void) {  // (the game's thread)
     for (int i = 0; i < n && v; i++) texture_retire(v[i]);
     free(v);
 }
+uint32_t tex_slot_gen = 1;
 RT_ON_RESET(slot_old_reset) {  // (every texture goes with the reset)
     pthread_mutex_lock(&slot_m);
     slot_nold = 0;
     pthread_mutex_unlock(&slot_m);
+    tex_slot_gen++;
 }
 static void slot_apply(void *arg) {
     SlotReg *r = arg;
@@ -1269,6 +1271,7 @@ static void slot_apply(void *arg) {
         LOG("[watch] texture id %#x <- %p %ux%u levels %u view %d setmask %#x levels %u+%u (lr %llx)\n", r->id, (void *)t,
             t ? t->width : 0, t ? t->height : 0, t ? t->levels : 0, e->has_view, e->has_view ? e->view.setmask : 0,
             e->view.base_level, e->view.num_levels, (unsigned long long)r->lr);
+    tex_slot_gen++;
 }
 static void register_texture(Cpu *c) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));
@@ -1287,10 +1290,9 @@ static void register_texture(Cpu *c) {
     if (sw) r.has_sw = true, memcpy(r.sw, sw, 4);
 #ifdef __ANDROID__
     static int drain = -1;
-    if (drain < 0) {  // (queued on low RAM - the weak phones, vulkan/exec.c vk_low_ram - for now)
-        extern bool vk_low_ram(void);
+    if (drain < 0) {
         const char *e = getenv("LARECOMP_SLOT_DRAIN");
-        drain = e ? atoi(e) != 0 : !vk_low_ram();
+        drain = e ? atoi(e) != 0 : 0;
     }
     if (!drain) {
         SlotReg *q = malloc(sizeof *q);
@@ -1324,18 +1326,42 @@ NVN(nvnSamplerPoolGetSize) { RET(G(uint32_t, A(0), 24)); }
 // A sampler slot rewritten: the render thread may still have draws queued that read the old one (vulkan/async.c) -
 // BOTW recycles slots without a fence wait between (its bloom's mip chain then read a recycled 0..0 LOD clamp: only
 // level 0, a blocky glow around the Sheikah lights). Like a texture slot replaced (register_texture): drain first.
+typedef struct { NvnSamplerDesc *e; NvnSamplerDesc v; } SmpReg;
+static uint32_t smp_pending;
+static void smp_apply(void *arg) {
+    SmpReg *r = arg;
+    *r->e = r->v;
+    tex_slot_gen++;
+    __atomic_sub_fetch(&smp_pending, 1, __ATOMIC_RELEASE);
+}
 static void register_sampler(NvnSamplerDesc *e, const NvnSamplerDesc *n) {
     NvnSamplerDesc v = *n;
     v.backend = NULL;  // (the VkSampler is made per slot, from its fields)
     NvnSamplerDesc o = *e;
     o.backend = NULL;
-    if (!memcmp(&o, &v, sizeof v)) return;
+    if (__atomic_load_n(&smp_pending, __ATOMIC_ACQUIRE) == 0 && !memcmp(&o, &v, sizeof v)) return;
 #ifdef __ANDROID__
+    static int drain = -1;
+    if (drain < 0) {
+        const char *ev = getenv("LARECOMP_SMP_DRAIN");
+        drain = ev ? atoi(ev) != 0 : 0;
+    }
+    if (!drain) {
+        SmpReg *q = malloc(sizeof *q);
+        if (q) {
+            *q = (SmpReg){e, v};
+            extern void vk_async_call(void (*fn)(void *), void *arg);
+            __atomic_add_fetch(&smp_pending, 1, __ATOMIC_RELAXED);
+            vk_async_call(smp_apply, q);
+            return;
+        }
+    }
     static int off = -1;
     if (off < 0) off = getenv("LARECOMP_NO_SMP_DRAIN") != NULL;
     if (!off) vk_async_drain();
 #endif
     *e = v;
+    tex_slot_gen++;
 }
 NVN(nvnSamplerPoolRegisterSampler) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));
