@@ -1564,11 +1564,20 @@ static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t al
     } ways[DEDUPE_SLOTS][DEDUPE_WAYS];
     static uint8_t rr[DEDUPE_SLOTS], mru[DEDUPE_SLOTS];
     if (size > sizeof ways[0][0].data) return vk_transient_copy(data, size, align);
-    uint64_t h = dedupe_hash64(data, size);
+    uint64_t h = 0;
+    bool hashed = false;
     if (active >= 0) {
         VkBuffer abuf = chunks[active].buf;
         uint8_t first = mru[slot] & 3u;
-        for (int k = 0; k < DEDUPE_WAYS; k++) {
+        if (ways[slot][first].epoch == chunk_epoch && ways[slot][first].buf == abuf &&
+            ways[slot][first].size == size && !memcmp(ways[slot][first].data, data, size)) {
+            chunks[active].seq = vk_pending_seq();
+            chunks[active].frame = renderer_present_count();
+            return ways[slot][first].span;
+        }
+        h = dedupe_hash64(data, size);
+        hashed = true;
+        for (int k = 1; k < DEDUPE_WAYS; k++) {
             int w = (first + k) & 3;
             if (ways[slot][w].epoch == chunk_epoch && ways[slot][w].buf == abuf &&
                 ways[slot][w].hash == h && ways[slot][w].size == size &&
@@ -1580,6 +1589,7 @@ static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t al
             }
         }
     }
+    if (!hashed) h = dedupe_hash64(data, size);
     VkSpan s = vk_transient_copy(data, size, align);
     int w = rr[slot] & 3;
     rr[slot] = (uint8_t)((w + 1) & 3);
@@ -2031,6 +2041,48 @@ static uint64_t st_ubo_data_ver = 1;
 static uint64_t st_stage_ubo_data_ver[6] = {1, 1, 1, 1, 1, 1};
 static uint64_t g_exec_list_seq = 1;
 static uint64_t g_gpu_copy_ver = 1;
+
+#ifdef __ANDROID__
+enum { FAST2_BLOOM_WORDS = 4 };
+static uint64_t fast2_ubo_bloom[2][FAST2_BLOOM_WORDS];
+static uint64_t fast2_bloom_seq[2];
+static bool fast2_ubo_wide[2];
+
+static inline void fast2_bloom_mark(int stage, const Range *cb, int ncb) {
+    if ((unsigned)stage >= 2u) return;
+    if (fast2_bloom_seq[stage] != g_exec_list_seq) {
+        memset(fast2_ubo_bloom[stage], 0, sizeof fast2_ubo_bloom[stage]);
+        fast2_ubo_wide[stage] = false;
+        fast2_bloom_seq[stage] = g_exec_list_seq;
+    }
+    for (int c = 0; c < ncb; c++) {
+        uint64_t a = cb[c].addr;
+        if (!a) continue;
+        uint64_t sz = cb[c].size ? cb[c].size : 0x10000ull;
+        uint64_t p0 = a >> 12, p1 = (a + sz - 1) >> 12;
+        if (p1 - p0 > 32) {
+            fast2_ubo_wide[stage] = true;
+            continue;
+        }
+        for (uint64_t p = p0; p <= p1; p++) {
+            uint32_t bit = (uint32_t)(p * 0x9E3779B97F4A7C15ull >> 56);
+            fast2_ubo_bloom[stage][bit >> 6] |= 1ull << (bit & 63u);
+        }
+    }
+}
+
+static inline bool fast2_bloom_overlaps(int stage, uint64_t lo, uint64_t hi) {
+    if ((unsigned)stage >= 2u || fast2_bloom_seq[stage] != g_exec_list_seq || lo >= hi) return false;
+    if (fast2_ubo_wide[stage]) return true;
+    uint64_t p0 = lo >> 12, p1 = (hi - 1) >> 12;
+    if (p1 - p0 > 32) return true;
+    for (uint64_t p = p0; p <= p1; p++) {
+        uint32_t bit = (uint32_t)(p * 0x9E3779B97F4A7C15ull >> 56);
+        if (fast2_ubo_bloom[stage][bit >> 6] & (1ull << (bit & 63u))) return true;
+    }
+    return false;
+}
+#endif
 
 static inline void bump_state_vers(void) {
     for (int i = 0; i < 6; i++) {
@@ -2624,11 +2676,11 @@ static void begin_pass(void) {
         extern bool vk_async_on(void);
         static long chunk = -1;
         if (chunk < 0) {
-            // Chunk at pass boundaries on Mali (10 ms + >=800 draws) so G-buffer + setup overlap GPU execution
+            // Chunk at pass boundaries on Mali (8 ms + >=800 draws) so G-buffer + setup overlap GPU execution
             // without flushing 0-draw clear/setup passes or thrashing vcache 6-15x per frame.
             extern bool vk_driver_is_qualcomm(void);
             const char *e = getenv("LARECOMP_VK_CHUNK_US");
-            chunk = e ? atol(e) : vk_driver_is_qualcomm() ? 0 : g_vk.props.vendorID == 0x13B5 ? 10000 : 2000;
+            chunk = e ? atol(e) : vk_driver_is_qualcomm() ? 0 : g_vk.props.vendorID == 0x13B5 ? 8000 : 2000;
         }
         extern int vk_ab(const char *what);
         long ch = chunk > 0 && AB("chunk") == 1 ? 500 : chunk;
@@ -3823,7 +3875,7 @@ static int pipe_keep(void) {
             keep = atoi(e);
         } else if (g_vk.props.vendorID == 0x5143 && !vk_low_ram()) {
             keep = 0;
-        } else if (!vk_low_ram()) {
+        } else if (!vk_conserve_ram()) {
             long total_kb = 0;
             FILE *f = fopen("/proc/meminfo", "r");
             if (f) {
@@ -3831,6 +3883,8 @@ static int pipe_keep(void) {
                 fclose(f);
             }
             keep = (total_kb >= 7L * 1024 * 1024) ? 4096 : 1500;
+        } else if (g_vk.props.vendorID == 0x13B5 && !vk_low_ram()) {
+            keep = 1000;
         } else {
             keep = 800;
         }
@@ -3854,10 +3908,10 @@ static void pipe_evict(void) {
     uint64_t done = vk_completed_seq();
     int target = keep * 4 / 5, gone = 0;
     // oldest first: two passes, shorter windows when conserving RAM
-    const bool low = vk_low_ram();
+    const bool short_win = vk_low_ram() || vk_conserve_ram();
     const uint64_t ages[2] = {
-        low ? 90000000000ull : 600000000000ull,
-        low ? 30000000000ull : 180000000000ull,
+        short_win ? 90000000000ull : 600000000000ull,
+        short_win ? 30000000000ull : 180000000000ull,
     };
     for (int pass = 0; pass < 2 && live > target; pass++) {
         uint64_t age = ages[pass];
@@ -3875,6 +3929,9 @@ static void pipe_evict(void) {
             live--, gone++;
         }
     }
+#if defined(__ANDROID__) && defined(M_PURGE)
+    if (gone >= 8 && short_win) mallopt(M_PURGE, 0);
+#endif
     static int nlog;
     if (gone && nlog++ < 20) LOG("[vk] pipelines: %d unused ones destroyed, %d kept\n", gone, live);
 }
@@ -4405,7 +4462,7 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
     extern uint32_t tex_slot_gen;
     typedef struct {
         Prog *pr;
-        uint64_t rt_ver, t0_ver, t1_ver, u0_ver, u1_ver, pool_ver, gcopy_ver, ubo_data_ver, exec_seq, frame;
+        uint64_t rt_ver, t0_ver, t1_ver, u0_ver, u1_ver, pool_ver, gcopy_ver, u0_data_ver, u1_data_ver, exec_seq, frame;
         uint32_t sgen;
         bool clean;
     } RfMemo;
@@ -4420,7 +4477,9 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
             m->t1_ver == st_tex_ver[1] && m->pool_ver == st_pool_ver && m->gcopy_ver == g_gpu_copy_ver && m->sgen == tex_slot_gen &&
             m->frame == cur_frame &&
             (!bindless || (m->u0_ver == st_ubuf_ver[0] && m->u1_ver == st_ubuf_ver[1] &&
-                           m->ubo_data_ver == st_ubo_data_ver && m->exec_seq == g_exec_list_seq))) {
+                           m->u0_data_ver == st_stage_ubo_data_ver[0] &&
+                           m->u1_data_ver == st_stage_ubo_data_ver[1] &&
+                           m->exec_seq == g_exec_list_seq))) {
             return;
         }
     }
@@ -4557,7 +4616,8 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
         rf_memo[rslot] = (RfMemo){
             .pr = pr, .rt_ver = st_rt_ver, .t0_ver = st_tex_ver[0], .t1_ver = st_tex_ver[1],
             .u0_ver = st_ubuf_ver[0], .u1_ver = st_ubuf_ver[1], .pool_ver = st_pool_ver,
-            .gcopy_ver = g_gpu_copy_ver, .ubo_data_ver = st_ubo_data_ver, .exec_seq = g_exec_list_seq,
+            .gcopy_ver = g_gpu_copy_ver, .u0_data_ver = st_stage_ubo_data_ver[0],
+            .u1_data_ver = st_stage_ubo_data_ver[1], .exec_seq = g_exec_list_seq,
             .frame = cur_frame, .sgen = tex_slot_gen, .clean = true,
         };
     }
@@ -4829,7 +4889,24 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     int idx = k - 3;  // cbuf_base
     Range r = (idx >= 0 && idx < 18) ? st.ubuf[stage][idx] : (Range){0, 0};
     uint64_t size = si->cbuf_size[k] ? si->cbuf_size[k] : 256;
-    if (!r.addr) return ubo_span(vk_transient_copy(zeros, size, 256), size);
+    if (!r.addr) {
+        typedef __typeof__(vk_transient_copy(zeros, size, 256)) ZeroSpan;
+        static struct {
+            uint64_t epoch, size;
+            ZeroSpan span;
+        } zc;
+        if (size <= sizeof zeros) {
+            uint64_t alloc_sz = size < 0x1000 ? 0x1000 : size;
+            if (active < 0 || !zc.span.buf || zc.epoch != chunk_epoch ||
+                zc.span.buf != chunks[active].buf || zc.size < alloc_sz) {
+                zc.span = vk_transient_copy(zeros, alloc_sz, 256);
+                zc.epoch = chunk_epoch;
+                zc.size = alloc_sz;
+            }
+            return ubo_span(zc.span, size);
+        }
+        return ubo_span(vk_transient_copy(zeros, size, 256), size);
+    }
     if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
     if (size > r.size && r.size) size = r.size;
     if (size < 16) size = 16;
@@ -6379,7 +6456,7 @@ static uint64_t vc_budget(void) {
             if (fscanf(f, "MemTotal: %ld kB", &total_kb) != 1) total_kb = 0;
             fclose(f);
         }
-        b = vk_conserve_ram() ? (vk_low_ram() ? 256ull << 20 : 512ull << 20) : 768ull << 20;
+        b = vk_conserve_ram() ? (vk_low_ram() ? 256ull << 20 : 320ull << 20) : 768ull << 20;
         if (vk_low_ram() && total_kb && (uint64_t)total_kb * 1024 / 12 < b)
             b = (uint64_t)total_kb * 1024 / 12;
         if (e && atol(e) > 0) b = (uint64_t)atol(e) << 20;
@@ -6877,7 +6954,7 @@ static inline void fast_tab_insert(StageSetFast *way, ShaderInfo *si, VkDescript
         .si = si, .layout = layout, .ds = ds, .gmem_buf = gmem_buf,
         .ubuf_ver = st_ubuf_ver[stage], .sbuf_ver = st_sbuf_ver[stage],
         .tex_ver = st_tex_ver[stage], .img_ver = st_img_ver[stage],
-        .pool_ver = st_pool_ver, .ubo_data_ver = st_ubo_data_ver,
+        .pool_ver = st_pool_ver, .ubo_data_ver = st_stage_ubo_data_ver[stage],
         .exec_seq = g_exec_list_seq, .epoch = chunk_epoch,
         .gcopy_gen = gcopy_gen, .gpu_copy_ver = g_gpu_copy_ver, .frame = cur_frame,
         .fii_stamp = fii_stamp,
@@ -6904,7 +6981,7 @@ typedef struct {
     float rs0[4], tint[8];
     Range cb[8];
 } StageFast2;
-static StageFast2 fast2_tab[2][512][2];
+static StageFast2 fast2_tab[2][1024][2];
 
 static inline uint32_t fast2_bucket(const ShaderInfo *si, VkDescriptorSetLayout layout, int stage,
                                     const Range *cb, int ncb, uint64_t k1_addr, uint64_t extra) {
@@ -6914,7 +6991,7 @@ static inline uint32_t fast2_bucket(const ShaderInfo *si, VkDescriptorSetLayout 
         h ^= cb[i].addr * 0x9E3779B97F4A7C15ull ^ (cb[i].size * 0x517CC1B727220A95ull);
         h = (h ^ (h >> 29)) * 0x94D049BB133111EBull;
     }
-    return (uint32_t)(h ^ (h >> 18) ^ (h >> 36)) & 511u;
+    return (uint32_t)(h ^ (h >> 18) ^ (h >> 36)) & 1023u;
 }
 
 static inline void fast2_tab_insert(StageFast2 *way, ShaderInfo *si, VkDescriptorSetLayout layout,
@@ -6926,7 +7003,7 @@ static inline void fast2_tab_insert(StageFast2 *way, ShaderInfo *si, VkDescripto
     way[0] = (StageFast2){
         .si = si, .layout = layout, .ds = ds, .gmem_buf = gmem_buf,
         .exec_seq = g_exec_list_seq, .epoch = chunk_epoch, .gcopy_gen = gcopy_gen,
-        .gpu_copy_ver = g_gpu_copy_ver, .frame = cur_frame, .ubo_data_ver = st_ubo_data_ver,
+        .gpu_copy_ver = g_gpu_copy_ver, .frame = cur_frame, .ubo_data_ver = st_stage_ubo_data_ver[stage],
         .pool_ver = st_pool_ver, .sbuf_ver = st_sbuf_ver[stage], .img_ver = st_img_ver[stage],
         .tex_ver = st_tex_ver[0], .fii_stamp = fii_stamp, .k1_addr = k1_addr,
         .rgen = rgen, .vgen = vgen, .sgen = sgen, .bank_epoch = bank_epoch,
@@ -6938,7 +7015,12 @@ static inline void fast2_tab_insert(StageFast2 *way, ShaderInfo *si, VkDescripto
         memcpy(way[0].rs0, rs0, sizeof way[0].rs0);
         memcpy(way[0].tint, tint, sizeof way[0].tint);
     }
-    if (ncb) memcpy(way[0].cb, cb, (size_t)ncb * sizeof cb[0]);
+    if (ncb) {
+        memcpy(way[0].cb, cb, (size_t)ncb * sizeof cb[0]);
+#ifdef __ANDROID__
+        fast2_bloom_mark(stage, cb, ncb);
+#endif
+    }
 }
 #endif
 
@@ -6959,10 +7041,11 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         if (rscale_row0) memcpy(rs0_cur, rscale_row0, 16);
         if (tint) memcpy(tint_cur, tint, 32);
     }
+    uint64_t fii_stamp_cur = (stage == 1 && si->ntex) ? fii_memo_active_id : 0;
     bool can_fast = !fast_off && !set_cache_off && stage < 2 && !bindless && !si->uses_gmem_map &&
                     !up_fix.sx && !naliases &&
-                    ((stage == 0 && si->ntex == 0) || (!nfeedback && !n_pass_fb && !scene_up.t)) &&
-                    (stage == 0 || (pre_ii && fii_memo_active_id));
+                    (si->ntex == 0 || (!nfeedback && !n_pass_fb && !scene_up.t)) &&
+                    (stage == 0 || !si->ntex || (pre_ii && fii_stamp_cur));
     if (can_fast && stage == 0) {
         NvnTexture *rt0 = st.rt.ncolor ? st.rt.color[0] : NULL;
         if (rt0 && vk_texture_scale_group(rt0) == RS_OUT) can_fast = false;
@@ -6977,14 +7060,14 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 f->rgen == desc_res_gen && f->vgen == vk_view_gen && f->sgen == tex_slot_gen &&
                 f->ubuf_ver == st_ubuf_ver[stage] && f->sbuf_ver == st_sbuf_ver[stage] &&
                 f->tex_ver == st_tex_ver[stage] && f->img_ver == st_img_ver[stage] &&
-                f->pool_ver == st_pool_ver && f->ubo_data_ver == st_ubo_data_ver &&
+                f->pool_ver == st_pool_ver && f->ubo_data_ver == st_stage_ubo_data_ver[stage] &&
                 f->exec_seq == g_exec_list_seq && f->epoch == chunk_epoch &&
                 f->gcopy_gen == gcopy_gen && f->frame == cur_frame && f->gmem_buf == gmem_buf &&
                 (!si->uses_rscale || f->mirror_w == g_mirror_w) &&
                 (stage == 0 ? (!si->ntex || f->gpu_copy_ver == g_gpu_copy_ver)
-                            : (f->fii_stamp == fii_memo_active_id &&
-                               !memcmp(f->rs0, rs0_cur, sizeof rs0_cur) &&
-                               !memcmp(f->tint, tint_cur, sizeof tint_cur)))) {
+                            : ((!si->ntex || f->fii_stamp == fii_stamp_cur) &&
+                               (!si->uses_rscale || !memcmp(f->rs0, rs0_cur, sizeof rs0_cur)) &&
+                               (!si->uses_tint || !memcmp(f->tint, tint_cur, sizeof tint_cur))))) {
                 desc_banks[(int)f->bank].last_seq = pending;
                 if (dyn && f->ndyn) memcpy(dyn, f->dyn, f->ndyn * sizeof f->dyn[0]);
                 if (ndyn) *ndyn = f->ndyn;
@@ -7012,7 +7095,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 cur_cb[ncb++] = st.ubuf[stage][idx];
             }
             k1_addr = (si->cbuf_mask & 2u) ? (st.program->stages[stage].code_addr + st.program->stages[stage].const_offset) : 0;
-            uint64_t extra = stage == 1 ? fii_memo_active_id : (si->ntex ? st_tex_ver[0] : 0);
+            uint64_t extra = stage == 1 ? fii_stamp_cur : (si->ntex ? st_tex_ver[0] : 0);
             bkt2 = fast2_bucket(si, layout, stage, cur_cb, ncb, k1_addr, extra);
             fast2_ready = true;
             StageFast2 *way2 = fast2_tab[stage][bkt2];
@@ -7022,13 +7105,13 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                     e->bank >= 0 && desc_banks[(int)e->bank].epoch == e->bank_epoch &&
                     e->rgen == desc_res_gen && e->vgen == vk_view_gen && e->sgen == tex_slot_gen &&
                     e->sbuf_ver == st_sbuf_ver[stage] && e->img_ver == st_img_ver[stage] &&
-                    e->pool_ver == st_pool_ver && e->ubo_data_ver == st_ubo_data_ver &&
+                    e->pool_ver == st_pool_ver && e->ubo_data_ver == st_stage_ubo_data_ver[stage] &&
                     e->exec_seq == g_exec_list_seq && e->epoch == chunk_epoch &&
                     e->gcopy_gen == gcopy_gen && e->frame == cur_frame && e->gmem_buf == gmem_buf &&
                     e->cbuf_mask == umask && e->ncb == (uint8_t)ncb && e->k1_addr == k1_addr &&
                     (!si->uses_rscale || e->mir_w == g_mirror_w) &&
                     (stage == 0 ? (!si->ntex || (e->tex_ver == st_tex_ver[0] && e->gpu_copy_ver == g_gpu_copy_ver))
-                                : (e->fii_stamp == fii_memo_active_id &&
+                                : ((!si->ntex || e->fii_stamp == fii_stamp_cur) &&
                                    (!si->uses_rscale || !memcmp(e->rs0, rs0_cur, sizeof rs0_cur)) &&
                                    (!si->uses_tint || !memcmp(e->tint, tint_cur, sizeof tint_cur))))) {
                     bool cb_ok = true;
@@ -7047,7 +7130,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                     StageFast2 *hit = &way2[0];
                     if (hit->ndyn <= 24)
                         fast_tab_insert(fast_tab[stage][fbucket], si, layout, hit->ds, stage, set, hit->bank,
-                                        hit->bank_epoch, fii_memo_active_id, cur_frame, desc_res_gen, vk_view_gen,
+                                        hit->bank_epoch, fii_stamp_cur, cur_frame, desc_res_gen, vk_view_gen,
                                         tex_slot_gen, rs0_cur, tint_cur, hit->dyn, hit->ndyn);
                     prof_set_hits++;
                     return hit->ds;
@@ -7256,11 +7339,11 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 desc_banks[(int)ent->bank].last_seq = pending;
                 if (can_fast && dyn && nd <= 24)
                     fast_tab_insert(fast_tab[stage][fbucket], si, layout, ent->ds, stage, set, ent->bank,
-                                    ent->epoch, fii_memo_active_id, cur_frame, desc_res_gen, vk_view_gen,
+                                    ent->epoch, fii_stamp_cur, cur_frame, desc_res_gen, vk_view_gen,
                                     tex_slot_gen, rs0_cur, tint_cur, dyn, nd);
                 if (fast2_ready && dyn && nd <= 16)
                     fast2_tab_insert(fast2_tab[stage][bkt2], si, layout, ent->ds, stage, set, ent->bank,
-                                     ent->epoch, fii_memo_active_id, k1_addr, cur_frame, desc_res_gen,
+                                     ent->epoch, fii_stamp_cur, k1_addr, cur_frame, desc_res_gen,
                                      vk_view_gen, tex_slot_gen, umask, cur_cb, ncb, rs0_cur, tint_cur,
                                      dyn, nd);
                 prof_set_hits++;
@@ -7295,11 +7378,11 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                                .rgen = desc_res_gen, .vgen = vk_view_gen, .bank = (int8_t)bank};
             if (can_fast && dyn && nd <= 24)
                 fast_tab_insert(fast_tab[stage][fbucket], si, layout, ds, stage, set, (int8_t)bank,
-                                desc_banks[bank].epoch, fii_memo_active_id, cur_frame, desc_res_gen,
+                                desc_banks[bank].epoch, fii_stamp_cur, cur_frame, desc_res_gen,
                                 vk_view_gen, tex_slot_gen, rs0_cur, tint_cur, dyn, nd);
             if (fast2_ready && dyn && nd <= 16)
                 fast2_tab_insert(fast2_tab[stage][bkt2], si, layout, ds, stage, set, (int8_t)bank,
-                                 desc_banks[bank].epoch, fii_memo_active_id, k1_addr, cur_frame, desc_res_gen,
+                                 desc_banks[bank].epoch, fii_stamp_cur, k1_addr, cur_frame, desc_res_gen,
                                  vk_view_gen, tex_slot_gen, umask, cur_cb, ncb, rs0_cur, tint_cur, dyn, nd);
         }
         return ds;
@@ -8362,7 +8445,7 @@ static void draw_(CmdRec *r, bool indexed) {
         float sc[64][2];
         uint32_t wh[64][2];
     } FiiMemo;
-    static FiiMemo fii_memo[64];
+    static FiiMemo fii_memo[128][2];
     extern uint32_t vk_view_gen, tex_slot_gen;
     static uint64_t next_fii_stamp = 1;
     fii_memo_active_id = 0;
@@ -8372,11 +8455,24 @@ static void draw_(CmdRec *r, bool indexed) {
         fii_memo_active_id = 1;
     } else if (can_fii_memo) {
         uint32_t fs = (uint32_t)((((uintptr_t)pr->fi * 0x9E3779B97F4A7C15ull) >> 32) ^
-                                 (st_tex_ver[1] * 0xC2B2AE3Du)) & 63u;
-        FiiMemo *fm = &fii_memo[fs];
-        if (fm->fi == pr->fi && fm->ntex == pr->fi->ntex && fm->tex_ver == st_tex_ver[1] &&
-            fm->pool_ver == st_pool_ver && fm->frame == fii_frame && fm->vgen == vk_view_gen &&
-            fm->sgen == tex_slot_gen && fm->gcopy_ver == g_gpu_copy_ver) {
+                                 (st_tex_ver[1] * 0xC2B2AE3Du)) & 127u;
+        FiiMemo *way = fii_memo[fs];
+        FiiMemo *fm = NULL;
+        for (int w = 0; w < 2; w++) {
+            FiiMemo *c = &way[w];
+            if (c->fi == pr->fi && c->ntex == pr->fi->ntex && c->tex_ver == st_tex_ver[1] &&
+                c->pool_ver == st_pool_ver && c->frame == fii_frame && c->vgen == vk_view_gen &&
+                c->sgen == tex_slot_gen && c->gcopy_ver == g_gpu_copy_ver) {
+                if (w == 1) {
+                    FiiMemo tmp = way[0];
+                    way[0] = way[1];
+                    way[1] = tmp;
+                }
+                fm = &way[0];
+                break;
+            }
+        }
+        if (fm) {
             fii_ptr = fm->ii;
             fii_sc = fm->sc;
             fii_wh = fm->wh;
@@ -8387,6 +8483,8 @@ static void draw_(CmdRec *r, bool indexed) {
                 texture_info(1, pr->fi, i, &fii[i], sc, wh);
                 tex_sc[1][i][0] = sc[0]; tex_sc[1][i][1] = sc[1]; tex_wh[1][i][0] = wh[0]; tex_wh[1][i][1] = wh[1];
             }
+            way[1] = way[0];
+            fm = &way[0];
             fm->fi = pr->fi; fm->ntex = pr->fi->ntex; fm->tex_ver = st_tex_ver[1];
             fm->pool_ver = st_pool_ver; fm->frame = fii_frame; fm->vgen = vk_view_gen;
             fm->sgen = tex_slot_gen; fm->gcopy_ver = g_gpu_copy_ver;
@@ -9795,6 +9893,7 @@ static void exec_list(uint64_t handle, int depth) {
                 guest_copy_invalidate(dst, dst + sz);
                 st_ubo_data_ver++;
                 uint64_t u_hi = dst + sz;
+                bool hit_bound[6] = {false};
                 for (int s = 0; s < 6; s++) {
                     for (int b = 0; b < 18; b++) {
                         uint64_t ba = st.ubuf[s][b].addr;
@@ -9802,10 +9901,22 @@ static void exec_list(uint64_t handle, int depth) {
                         uint64_t bsz = st.ubuf[s][b].size ? st.ubuf[s][b].size : 0x10000ull;
                         if (ba < u_hi && dst < ba + bsz) {
                             st_stage_ubo_data_ver[s]++;
+                            hit_bound[s] = true;
                             break;
                         }
                     }
                 }
+#ifdef __ANDROID__
+                for (int s = 0; s < 2; s++) {
+                    if (!hit_bound[s] && fast2_bloom_overlaps(s, dst, u_hi)) {
+                        st_stage_ubo_data_ver[s]++;
+                        memset(fast2_ubo_bloom[s], 0, sizeof fast2_ubo_bloom[s]);
+                        fast2_ubo_wide[s] = false;
+                    }
+                }
+#else
+                (void)hit_bound;
+#endif
             }
             break;
         }
