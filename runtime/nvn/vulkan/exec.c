@@ -1300,7 +1300,7 @@ VkSpan vk_transient_copy(const void *data, uint64_t size, uint64_t align) {
 
 // Per-draw constants that usually repeat the previous draw's (scale table, tint, driver constants): reuse that copy
 // while it's identical, within one submission. slot: one per kind of data.
-enum { DEDUPE_RSCALE_V, DEDUPE_RSCALE_F, DEDUPE_TINT, DEDUPE_DRV_V, DEDUPE_DRV_F, DEDUPE_DRV_C, DEDUPE_CBP_V, DEDUPE_CBP_F, DEDUPE_SLOTS };
+enum { DEDUPE_RSCALE_V, DEDUPE_RSCALE_F, DEDUPE_TINT, DEDUPE_DRV_V, DEDUPE_DRV_F, DEDUPE_DRV_C, DEDUPE_CBP_V, DEDUPE_CBP_F, DEDUPE_ZERO_16, DEDUPE_ZERO_256, DEDUPE_SLOTS };
 #ifdef __ANDROID__
 // This draw's gmap table (gmap_tab) in transient memory, shared with the draws of the submission that have the same
 // one (the last 8 kept): the copy mode gives every draw that reaches global memory a table, and a new copy each time
@@ -1765,9 +1765,14 @@ const char *renderer_stats(void) {
 
 // Baked state changes and pass restarts invalidate the last pipeline; dynamic state does not.
 static bool pipeline_dirty = true;
+static uint64_t pipe_state_ver = 1;
+static inline void pipe_mark_dirty(bool changed) {
+    if (changed) { pipeline_dirty = true; pipe_state_ver++; }
+}
 
 static void st_defaults(void) {
     pipeline_dirty = true;
+    pipe_state_ver++;
     memset(&st, 0, sizeof st);
     for (int i = 0; i < 16; i++) {
         st.viewport[i][2] = 1280; st.viewport[i][3] = 720;
@@ -1783,7 +1788,13 @@ static void st_defaults(void) {
 }
 
 void vk_exec_init(void) {
-    prof = getenv("LARECOMP_VK_PROF") != NULL;
+    const char *vk_prof_env = getenv("LARECOMP_VK_PROF");
+#ifdef __ANDROID__
+    prof = vk_prof_env ? atoi(vk_prof_env) != 0 : g_settings.vk_prof;
+#else
+    prof = vk_prof_env ? atoi(vk_prof_env) != 0 : 0;
+#endif
+    if (!prof) prof_up_ns = ~0ull;
 #ifdef __ANDROID__
     extern void vk_memfd_probe(void);
     vk_memfd_probe();  // (LARECOMP_MEMFD_PROBE=1: memfd_probe.c)
@@ -2256,6 +2267,7 @@ static bool no_chunks_now(void) {
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     pipeline_dirty = true;
+    pipe_state_ver++;
     vk_end_pass();
     if (st.rt.depth && st.rt.ncolor >= 3 && st.rt.color[0] && vk_texture_scale_group(st.rt.color[0]) == RS_SCENE) {
         g_scene_frame = renderer_present_count();
@@ -7197,10 +7209,36 @@ static void draw_(CmdRec *r, bool indexed) {
         reuse = !e || atoi(e) != 0;
         verify = getenv("LARECOMP_VK_PIPE_VERIFY") != NULL;
     }
+#ifdef __ANDROID__
+    uint32_t fpep = mru_epoch;
+    uint64_t pver = pipe_state_ver;
+    typedef struct { Prog *prog; PipeFx fx; uint64_t ver; uint32_t epoch; uint8_t cls, pre_key; Pipe *pp; } FastPipeMru;
+    static FastPipeMru fast_mru[4];
+    Pipe *pp = NULL;
+    bool hit = false;
+    if (reuse) {
+        for (int i = 0; i < 4; i++) {
+            if (fast_mru[i].pp && fast_mru[i].epoch == fpep && fast_mru[i].ver == pver && fast_mru[i].prog == pr &&
+                fast_mru[i].cls == cls && fast_mru[i].pre_key == pre_key && !fast_mru[i].pp->evicted &&
+                (g_vk.eds || !memcmp(&fast_mru[i].fx, &fx, sizeof fx))) {
+                pp = fast_mru[i].pp;
+                hit = true;
+                if (i > 0) {
+                    FastPipeMru tmp = fast_mru[i];
+                    for (int j = i; j > 0; j--) fast_mru[j] = fast_mru[j - 1];
+                    fast_mru[0] = tmp;
+                }
+                last_pipeline = pp;
+                break;
+            }
+        }
+    }
+#else
     bool hit = reuse && !pipeline_dirty && last_pipeline &&
                last_pipeline->k.prog == pr && last_pipeline->k.topo_class == cls && last_pipeline->k.prim_restart == pre_key &&
                (g_vk.eds || !memcmp(&last_pipeline->k.fx, &fx, sizeof fx));
     Pipe *pp = hit ? last_pipeline : NULL;
+#endif
     if (!hit || verify) {
         PipeKey k;
         memset(&k, 0, sizeof k);
@@ -7307,6 +7345,12 @@ static void draw_(CmdRec *r, bool indexed) {
             LOG("[vk] pipeline reuse: stale key detected\n");
             abort();
         }
+#ifdef __ANDROID__
+        if (!hit && reuse) {
+            for (int j = 3; j > 0; j--) fast_mru[j] = fast_mru[j - 1];
+            fast_mru[0] = (FastPipeMru){.prog = pr, .fx = fx, .ver = pver, .epoch = fpep, .cls = cls, .pre_key = pre_key, .pp = pp};
+        }
+#endif
         last_pipeline = pp;
         pipeline_dirty = false;
     }
@@ -7555,12 +7599,12 @@ static void draw_(CmdRec *r, bool indexed) {
     }
 
     // ---- vertex streams: the range this draw can read, copied once per submission
-    for (int s = 0; s < 17; s++) {
-        if (!(pp->k.used_streams & (1u << s))) continue;
+    for (uint32_t m = pp->k.used_streams & 0x1FFFFu; m; m &= m - 1) {
+        int s = __builtin_ctz(m);
         VkSpan sp;
         if (s == ZERO_BINDING) {
             static const float zero[4] = {0, 0, 0, 1};
-            sp = vk_transient_copy(zero, 16, 16);
+            sp = copy_dedupe(DEDUPE_ZERO_16, zero, 16, 16);
         } else {
             Range v = st.vbuf[s];
             VkBuffer dbuf;
@@ -7601,7 +7645,7 @@ static void draw_(CmdRec *r, bool indexed) {
             else if (pp->k.divisor[s]) need = ((uint64_t)base_inst + inst + pp->k.divisor[s] - 1) / pp->k.divisor[s] * stride + 256;
             else need = (uint64_t)max_index * stride + 256;
             if (v.size && need > v.size) need = v.size;
-            if (!v.addr) { static const uint8_t zero[256]; sp = vk_transient_copy(zero, 256, 16); }
+            if (!v.addr) { static const uint8_t zero[256]; sp = copy_dedupe(DEDUPE_ZERO_256, zero, 256, 16); }
             else sp = guest_copy(v.addr, need ? need : 16);
         }
         VkDeviceSize off = sp.off;
@@ -8589,22 +8633,22 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         }
         case CMD_BIND_PROGRAM: st.program = (NvnProgram *)(uintptr_t)r->x[0]; break;
-        case CMD_BIND_BLEND: { uint8_t *b = x; pipeline_dirty |= memcmp(st.blend[b[0] & 7], b, 8) != 0; memcpy(st.blend[b[0] & 7], b, 8); break; }
-        case CMD_BIND_CHANNEL_MASK: pipeline_dirty |= memcmp(&st.channel_mask, x, 4) != 0; memcpy(&st.channel_mask, x, 4); break;
-        case CMD_BIND_COLOR: pipeline_dirty |= memcmp(st.color_state, x, 4) != 0; memcpy(st.color_state, x, 4); break;
+        case CMD_BIND_BLEND: { uint8_t *b = x; pipe_mark_dirty(memcmp(st.blend[b[0] & 7], b, 8) != 0); memcpy(st.blend[b[0] & 7], b, 8); break; }
+        case CMD_BIND_CHANNEL_MASK: pipe_mark_dirty(memcmp(&st.channel_mask, x, 4) != 0); memcpy(&st.channel_mask, x, 4); break;
+        case CMD_BIND_COLOR: pipe_mark_dirty(memcmp(st.color_state, x, 4) != 0); memcpy(st.color_state, x, 4); break;
         case CMD_BIND_DEPTH_STENCIL: memcpy(st.ds, x, 8); break;
-        case CMD_BIND_MULTISAMPLE: pipeline_dirty |= st.ms[0xC] != ((uint8_t *)x)[0xC]; memcpy(st.ms, x, 0x18); break;
-        case CMD_BIND_POLYGON: pipeline_dirty |= st.poly[2] != ((uint8_t *)x)[2]; memcpy(st.poly, x, 4); break;
+        case CMD_BIND_MULTISAMPLE: pipe_mark_dirty(st.ms[0xC] != ((uint8_t *)x)[0xC]); memcpy(st.ms, x, 0x18); break;
+        case CMD_BIND_POLYGON: pipe_mark_dirty(st.poly[2] != ((uint8_t *)x)[2]); memcpy(st.poly, x, 4); break;
         case CMD_BIND_VERTEX_ATTRIB: {
             int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
-            pipeline_dirty |= n != st.nattrib || memcmp(st.attrib, x, n * 4) != 0;
+            pipe_mark_dirty(n != st.nattrib || memcmp(st.attrib, x, n * 4) != 0);
             st.nattrib = n;
             memcpy(st.attrib, x, n * 4);
             break;
         }
         case CMD_BIND_VERTEX_STREAM: {
             int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
-            pipeline_dirty |= n != st.nstream || memcmp(st.stream, x, n * 8) != 0;
+            pipe_mark_dirty(n != st.nstream || memcmp(st.stream, x, n * 8) != 0);
             st.nstream = n;
             memcpy(st.stream, x, n * 8);
             break;
@@ -8680,7 +8724,7 @@ static void exec_list(uint64_t handle, int depth) {
         }
         case CMD_SET_POLYGON_OFFSET: memcpy(st.poly_offset, r->f, sizeof st.poly_offset); break;
         case CMD_SET_PRIMITIVE_RESTART: st.prim_restart = r->x[0] != 0; st.restart_index = (uint32_t)r->x[1]; break;
-        case CMD_SET_DEPTH_CLAMP: pipeline_dirty |= st.depth_clamp != (r->x[0] != 0); st.depth_clamp = r->x[0] != 0; break;
+        case CMD_SET_DEPTH_CLAMP: pipe_mark_dirty(st.depth_clamp != (r->x[0] != 0)); st.depth_clamp = r->x[0] != 0; break;
         case CMD_SET_COPY_STRIDES: st.copy_row_stride = r->x[0]; st.copy_image_stride = r->x[1]; break;
         case CMD_CLEAR_COLOR: {
             int index = (int)r->x[0];

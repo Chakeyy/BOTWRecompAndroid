@@ -71,6 +71,7 @@ Settings g_settings = {
     .native_code = true,        // (NCE default on ARM64 Android: runtime/native.c)
     .files_in_place = true,     // (zero-copy RomFS default: read straight from picked dump folder)
     .sync_lag = true,           // (a few more fps; the CPU's reads of GPU results a frame old: nvn/objects.c nvnSyncWait)
+    .vk_prof = true,            // ([vkprof] per-stage CPU/GPU counters in botwrecomp-log.txt; toggle in Prelaunch)
     .out_lines = OUT_AUTO,      // (POCO F7 Ultra, 3200x1440, 1.8.2's Great Plateau: GPU 22.8 ms a frame at the screen's,
                                 // 18.6 at 1080 lines with a larger scene - the final image's passes over 2.2x the pixels)
 #else
@@ -292,6 +293,7 @@ void settings_load(void) {
         else if (!strcmp(key, "inplace_reads")) g_settings.inplace_reads = !strcmp(val, "auto") ? -1 : atoi(val) != 0;
         else if (!strcmp(key, "turnip_lrz")) g_settings.turnip_lrz = !strcmp(val, "auto") ? -1 : atoi(val) != 0;
         else if (!strcmp(key, "log_file")) g_settings.log_file = atoi(val) != 0;
+        else if (!strcmp(key, "vk_prof")) g_settings.vk_prof = atoi(val) != 0;
         else if (!strcmp(key, "gpu_model")) snprintf(g_settings.gpu_model, sizeof g_settings.gpu_model, "%s", val);
         else if (!strcmp(key, "driver_env")) snprintf(g_settings.driver_env, sizeof g_settings.driver_env, "%s", val);
         else if (!strcmp(key, "heap_file")) g_settings.heap_file = atoi(val) != 0;
@@ -404,8 +406,8 @@ void settings_save(void) {
             g_settings.sync_lag, g_settings.native_code, g_settings.files_in_place);
     static const char *const tri[] = {"auto", "0", "1"};  // (-1 / 0 / 1)
 #define TRI(v) tri[(v) < 0 ? 0 : (v) ? 2 : 1]
-    fprintf(f, "gpu_heap = %s\ninplace_reads = %s\nturnip_lrz = %s\nlog_file = %d\ngpu_model = %s\n", TRI(g_settings.gpu_heap),
-            TRI(g_settings.inplace_reads), TRI(g_settings.turnip_lrz), g_settings.log_file, g_settings.gpu_model);
+    fprintf(f, "gpu_heap = %s\ninplace_reads = %s\nturnip_lrz = %s\nlog_file = %d\nvk_prof = %d\ngpu_model = %s\n", TRI(g_settings.gpu_heap),
+            TRI(g_settings.inplace_reads), TRI(g_settings.turnip_lrz), g_settings.log_file, g_settings.vk_prof, g_settings.gpu_model);
     fprintf(f, "driver_env = %s\nheap_file = %d\n", g_settings.driver_env, g_settings.heap_file);
 #undef TRI
     fprintf(f, "touch_drag_camera = %d\ntouch_drag_sens = %.2f\ntouch_sticks_hidden = %d\ntouch_half_areas = %d\n",

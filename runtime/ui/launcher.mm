@@ -1660,6 +1660,10 @@ static void prelaunch_tab(float sc) {
         std::string folder = g_log_folder;
         pthread_mutex_unlock(&g_lock);
         ImGui::Spacing();
+        if (ImGui::Checkbox(tr("Vulkan profiler"), &g_settings.vk_prof)) changed = true;
+        ImGui::TextDisabled("%s", tr("Logs per-stage CPU/GPU timings, descriptor cache hits, and pass restarts every 2 s "
+                                     "to botwrecomp-log.txt (LARECOMP_VK_PROF; applied at game start)."));
+        ImGui::Spacing();
         if (ImGui::Checkbox(tr("Save a log file"), &g_settings.log_file)) {
             changed = true;
             if (g_settings.log_file && folder.empty()) android_call("pickLogFolder");  // (then nativeLogFolderPicked)
