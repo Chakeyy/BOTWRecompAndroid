@@ -40,8 +40,9 @@ bool g_vk_render_started;
 static int on = -1;
 
 // The game's thread may run this many frames ahead of the render thread (the translation of one frame overlaps the
-// game's work on the next; more only adds latency). LARECOMP_VK_ASYNC_AHEAD=n.
-static int ahead = 1;
+// game's work on the next; default 2 so the game thread can record frame N+1 while the render thread is blocked in
+// vk_present_now waiting on BLASTBufferQueue / swapchain completion). LARECOMP_VK_ASYNC_AHEAD=n.
+static int ahead = 2;
 
 // The render thread's work for its last frame (requests run between two presents, ns): the frame pacer's other half
 static uint64_t frame_work, last_frame_work, frame_cpu, last_frame_cpu;

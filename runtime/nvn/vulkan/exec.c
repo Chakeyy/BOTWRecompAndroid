@@ -447,10 +447,13 @@ void vk_pace_frame(void) {
     // comfortable, the clocks stayed low and so did the mode)
     static int follow = -1;  // LARECOMP_ADPF_FOLLOW=1: the old target (the mode's own)
     if (follow < 0) follow = getenv("LARECOMP_ADPF_FOLLOW") != NULL;
-    {   // LARECOMP_ADPF_GPU=1 (a test): the GPU's time too (API 35+), so its governor would raise its clock for 60 fps
-        // as well. Accepted on the Snapdragon 8 Elite (2026-10-16) but nothing measurable changed: off by default.
+    {   // LARECOMP_ADPF_GPU=1 / 0: report the GPU's busy duration (API 35+ AWorkDuration) alongside CPU so Mali governors
+        // boost clocks cleanly under GPU-bound scenes (default on for Mali 0x13B5; opt-out via LARECOMP_ADPF_GPU=0).
         static int no_gpu = -1;
-        if (no_gpu < 0) no_gpu = getenv("LARECOMP_ADPF_GPU") == NULL;
+        if (no_gpu < 0) {
+            const char *e = getenv("LARECOMP_ADPF_GPU");
+            no_gpu = e ? atoi(e) == 0 : (g_vk.props.vendorID != 0x13B5);
+        }
         static uint64_t last_busy;
         uint64_t total = gpu_busy_total, gpu = total - last_busy;
         last_busy = total;
@@ -893,6 +896,7 @@ static void vk_pass_barrier_fragment(VkCommandBuffer cb) {
     VkMemoryBarrier2 mb = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
         .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                         VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
                         VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
@@ -915,6 +919,7 @@ static void vk_vertex_read_barrier(VkCommandBuffer cb) {
     VkMemoryBarrier2 mb = {
         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
         .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                         VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
@@ -1339,7 +1344,7 @@ bool vk_conserve_ram(void) {
     return cons;
 }
 #define CHUNK_SIZE (vk_low_ram() ? 16ull << 20 : 64ull << 20)
-#define RING_KEEP (vk_conserve_ram() ? 2 : 4)
+#define RING_KEEP (vk_low_ram() ? 2 : vk_conserve_ram() ? 3 : 4)
 typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t size, used, seq, frame; } Chunk;  // frame: last picked
 static Chunk *chunks;
 static int nchunks, active = -1;
@@ -1923,6 +1928,7 @@ static uint64_t st_tex_ver[6] = {1, 1, 1, 1, 1, 1};
 static uint64_t st_img_ver[6] = {1, 1, 1, 1, 1, 1};
 static uint64_t st_pool_ver = 1;
 static uint64_t st_rt_ver = 1;
+static uint64_t st_attrib_ver = 1;
 static uint64_t st_ubo_data_ver = 1;
 static uint64_t st_stage_ubo_data_ver[6] = {1, 1, 1, 1, 1, 1};
 static uint64_t g_exec_list_seq = 1;
@@ -1935,6 +1941,7 @@ static inline void bump_state_vers(void) {
     }
     st_pool_ver++;
     st_rt_ver++;
+    st_attrib_ver++;
     st_ubo_data_ver++;
     g_gpu_copy_ver++;
 }
@@ -2359,7 +2366,7 @@ static NvnTexture *inplace_tex[4];      // (targets this draw samples in place w
 static int ninplace, nfeedback;
 static int g_inplace_copy = -1;         // (those targets copied instead; -1: not decided yet this boot - vk_exec_reset)
 typedef struct { TexBackend *back; VkImage image; VkImageAspectFlags aspect; } PassFbBack;
-static PassFbBack pass_fb_backs[8];
+static PassFbBack pass_fb_backs[9];
 static int n_pass_fb;
 static uint8_t pass_fb_pipe_bits;       // bit 0: color feedback layout, bit 1: depth/stencil feedback layout
 static bool tex_in_pass_fb(const TexBackend *b) {
@@ -2376,7 +2383,7 @@ static bool tex_in_inplace(const NvnTexture *t) {
     return false;
 }
 static void pass_fb_record(TexBackend *b) {
-    if (!b || !b->image || n_pass_fb >= 8 || tex_in_pass_fb(b)) return;
+    if (!b || !b->image || n_pass_fb >= 9 || tex_in_pass_fb(b)) return;
     pass_fb_backs[n_pass_fb++] = (PassFbBack){b, b->image, b->aspect};
 }
 void vk_end_pass(void) { vk_end_pass_at(0); }
@@ -2387,13 +2394,14 @@ static void vk_end_pass_at(int line) {
     vk_end_rendering(vk_cmd());
     in_pass = false;
     if (n_pass_fb) {
-        VkImageMemoryBarrier2 bars[8];
+        VkImageMemoryBarrier2 bars[9];
         int nb = 0;
         for (int i = 0; i < n_pass_fb; i++) {
             if (!pass_fb_backs[i].image) continue;
             bars[nb++] = (VkImageMemoryBarrier2){
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
                 .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                                 VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
                 .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
                                  VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
@@ -2518,12 +2526,12 @@ static void begin_pass(void) {
         extern bool vk_async_on(void);
         static long chunk = -1;
         if (chunk < 0) {
-            // (not on Qualcomm's driver: its render thread is slow - ~12 ms a frame in the copy mode - so the GPU sat
-            // idle between the chunks, and the game, timing its frames on the GPU from start to end, saw the gaps as
-            // GPU time and stayed at 30 even indoors; a whole frame at once, it chose 60 there)
+            // (not on Qualcomm's driver or Mali in copy mode: the render thread is slow in copy mode, and mid-frame
+            // submissions re-run vc_flush / plat_written_pages mprotect scans 4-5x per frame while leaving GPU idle gaps)
             extern bool vk_driver_is_qualcomm(void);
             const char *e = getenv("LARECOMP_VK_CHUNK_US");
-            chunk = e ? atol(e) : vk_driver_is_qualcomm() ? 0 : g_vk.props.vendorID == 0x13B5 ? 4000 : 2000;
+            chunk = e ? atol(e) : (vk_driver_is_qualcomm() || (g_vk.props.vendorID == 0x13B5 && gcopy_mode)) ? 0
+                                : g_vk.props.vendorID == 0x13B5 ? 4000 : 2000;
         }
         extern int vk_ab(const char *what);
         long ch = chunk > 0 && AB("chunk") == 1 ? 500 : chunk;
@@ -2751,7 +2759,7 @@ static void begin_pass(void) {
         pass_fb_pipe_bits |= 2u;
     }
     if (n_pass_fb) {
-        VkImageMemoryBarrier2 bars[8];
+        VkImageMemoryBarrier2 bars[9];
         int nb = 0;
         for (int i = 0; i < n_pass_fb; i++) {
             if (!pass_fb_backs[i].image) continue;
@@ -3933,6 +3941,14 @@ static void snapshots_mark_fb_dirty(NvnTexture *t) {
     for (int i = 0; i < 8; i++) if (snap_tex[i] == t && snap_ok[i]) snap_fb_dirty[i] = true;
 }
 static void snapshots_flush_fb_dirty(const char *why) {
+    // On ARM Mali TBDR, breaking a 6-MRT G-buffer pass on every CMD_BARRIER between consecutive decal draws forces
+    // 37 full tile-buffer stores/reloads and 74 full-target copies per frame (~19 ms GPU). Keep the opaque G-buffer
+    // snapshot valid across intra-pass barriers so consecutive feedback decals share one pass and one snapshot pair;
+    // any non-feedback write (snapshots_invalidate) or target change ("rt-change") still invalidates immediately.
+    static int coalesce_mali_barrier = -1;
+    if (coalesce_mali_barrier < 0)
+        coalesce_mali_barrier = g_vk.props.vendorID == 0x13B5 && !getenv("LARECOMP_STRICT_FB_BARRIER");
+    if (coalesce_mali_barrier && in_pass && !st.rt_dirty && why && why[0] == 'b') return;
     for (int i = 0; i < 8; i++)
         if (snap_fb_dirty[i]) { snap_fb_dirty[i] = false; if (snap_ok[i]) { snap_ok[i] = false; snap_why[i] = why; } }
 }
@@ -4342,8 +4358,12 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
 #else
                     int inplace_setting = -1;
 #endif
-                    bool fb_ext = g_vk.feedback_loop && inplace_setting != 0 && !getenv("LARECOMP_FEEDBACK_COPY");
-                    bool inplace = getenv("LARECOMP_FEEDBACK_INPLACE") || fb_ext ||
+                    // On ARM Mali Valhall TBDR, COMBINED_IMAGE_SAMPLER reads DRAM/L2 rather than the on-chip tile buffer,
+                    // so in-place feedback requires breaking the render pass to flush tiles or sampling unwritten DRAM.
+                    // Default Mali to snapshot copies (which coalesce across decal barriers) unless explicitly overridden.
+                    bool is_mali = g_vk.props.vendorID == 0x13B5;
+                    bool fb_ext = g_vk.feedback_loop && !is_mali && inplace_setting != 0 && !getenv("LARECOMP_FEEDBACK_COPY");
+                    bool inplace = getenv("LARECOMP_FEEDBACK_INPLACE") || (is_mali && inplace_setting == 1) || fb_ext ||
                                    (vk_driver_is_turnip() && vk_turnip_path_on(inplace_setting));
                     g_inplace_copy = getenv("LARECOMP_FEEDBACK_COPY") != NULL || !inplace;
                     LOG("[vk] targets a draw writes, sampled by it: %s (%s)\n", g_inplace_copy ? "copies" : "in place",
@@ -6577,7 +6597,15 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     static TexFullMemo full_memo[4096];
     uint8_t mflags = (uint8_t)st_->type | (st_->shadow ? 0x40u : 0u) | (stage == 0 ? 0x80u : 0u);
     uint32_t fslot = (uint32_t)(((h * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)mflags * 0xC2B2AE3D27D4EB4Full)) >> 32) & 4095u;
-    bool can_full_memo = !nomemo && !naliases && !nfeedback && !n_pass_fb && !scene_up.t && h && st.tpool && st.spool;
+    uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
+    NvnTexEntry *e_pre = (h && st.tpool && tic < (uint32_t)st.tpool->count) ? &((NvnTexEntry *)st.tpool->entries)[tic] : NULL;
+    NvnTexture *t_pre = e_pre ? e_pre->tex : NULL;
+    bool is_fb_tex = false;
+    if (t_pre) {
+        for (int k = 0; k < nfeedback; k++) if (feedback_tex[k] == t_pre) { is_fb_tex = true; break; }
+        if (!is_fb_tex && n_pass_fb && tex_in_pass_fb((const TexBackend *)t_pre->backend)) is_fb_tex = true;
+    }
+    bool can_full_memo = !nomemo && !naliases && !is_fb_tex && !scene_up.t && h && st.tpool && st.spool;
     if (can_full_memo) {
         TexFullMemo *fm = &full_memo[fslot];
         if (fm->handle == h && fm->frame == frame && fm->tpool == st.tpool && fm->spool == st.spool &&
@@ -6590,12 +6618,11 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     }
     VkImageView view = VK_NULL_HANDLE;
     VkSampler smp = VK_NULL_HANDLE;
-    uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
     sc[0] = sc[1] = 1;
     wh[0] = wh[1] = 0;
     VkFormat tfmt = VK_FORMAT_UNDEFINED;  // (the image's: vk_format_filters_linear below)
-    if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
-        NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
+    if (e_pre) {
+        NvnTexEntry *e = e_pre;
         if (e->tex) {
             // Per-frame memo: ~2400 lookups per overworld frame recomputed the view (format / range math, cache
             // probe). The first lookup of a frame still runs vk_view (upload check); a view that may have been
@@ -7364,8 +7391,22 @@ static void draw_(CmdRec *r, bool indexed) {
     vkey.glsl = fkey.glsl = 1;
     vkey.flip_y = fkey.flip_y = nvn_window_origin() == 0;
     vkey.depth_minus_one = nvn_depth_mode() == 0;
-    for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
-    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(rt_format(i));
+    {
+        static uint64_t last_av, last_rv;
+        static uint8_t ak[32], rk[8];
+        if (last_av != st_attrib_ver) {
+            last_av = st_attrib_ver;
+            memset(ak, 0, sizeof ak);
+            for (int i = 0; i < st.nattrib; i++) ak[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
+        }
+        if (last_rv != st_rt_ver) {
+            last_rv = st_rt_ver;
+            memset(rk, 0, sizeof rk);
+            for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) rk[i] = (uint8_t)rt_kind(rt_format(i));
+        }
+        memcpy(vkey.attr_kind, ak, sizeof vkey.attr_kind);
+        memcpy(fkey.rt_kind, rk, sizeof fkey.rt_kind);
+    }
 #ifdef __ANDROID__
     if (maxwell_gmem_miss_log)  // (copy mode: early depth tests for the shaders that log misses - ShaderKey)
         fkey.no_ds_write = !st.rt.depth || !((st.ds[0] && st.ds[1]) || (st.ds[3] && ((st.stencil_mask[0] | st.stencil_mask[1]) & 0xFF)));
@@ -9320,16 +9361,21 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_BIND_POLYGON: pipe_mark_dirty(st.poly[2] != ((uint8_t *)x)[2]); memcpy(st.poly, x, 4); break;
         case CMD_BIND_VERTEX_ATTRIB: {
             int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
-            pipe_mark_dirty(n != st.nattrib || memcmp(st.attrib, x, n * 4) != 0);
-            st.nattrib = n;
-            memcpy(st.attrib, x, n * 4);
+            if (n != st.nattrib || memcmp(st.attrib, x, (size_t)n * 4) != 0) {
+                pipe_mark_dirty(true);
+                st_attrib_ver++;
+                st.nattrib = n;
+                memcpy(st.attrib, x, (size_t)n * 4);
+            }
             break;
         }
         case CMD_BIND_VERTEX_STREAM: {
             int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
-            pipe_mark_dirty(n != st.nstream || memcmp(st.stream, x, n * 8) != 0);
-            st.nstream = n;
-            memcpy(st.stream, x, n * 8);
+            if (n != st.nstream || memcmp(st.stream, x, (size_t)n * 8) != 0) {
+                pipe_mark_dirty(true);
+                st.nstream = n;
+                memcpy(st.stream, x, (size_t)n * 8);
+            }
             break;
         }
         case CMD_BIND_VERTEX_BUFFERS:
@@ -9642,7 +9688,7 @@ void backend_execute(uint64_t handle) {
 #endif
     static int log_lists = -1;  // LARECOMP_LOG_LISTS=1: the command lists of one frame in 120 (draws, passes, time)
     if (log_lists < 0) log_lists = getenv("LARECOMP_LOG_LISTS") != NULL;
-    uint64_t ll_d = stat_draws, ll_p = stat_passes, ll_t = log_lists ? plat_now_ns() : 0;
+    uint64_t ll_d = stat_draws, ll_p = stat_passes, ll_cs = stat_dispatches, ll_t = log_lists ? plat_now_ns() : 0;
     exec_list(handle, 0);
     guest_copy_flush();
     if (log_lists && renderer_present_count() % 120 == 0)
@@ -9651,10 +9697,13 @@ void backend_execute(uint64_t handle) {
             (plat_now_ns() - ll_t) / 1e6);
     PROF_ADD(prof_exec);
     if (prof) cum_exec += SDL_GetTicksNS() - prof_t0_;
-    static int sync_submit = -1;
+    static int sync_submit = -1, submit_empty = -1;
     if (sync_submit < 0) sync_submit = getenv("LARECOMP_SYNC_SUBMIT") ? 1 : 0;
+    if (submit_empty < 0) submit_empty = getenv("LARECOMP_SUBMIT_EMPTY_LISTS") ? 1 : 0;
+    // Coalesce 0-draw, 0-dispatch setup/clear command lists (e.g. BOTW's initial 1920x1080 clear list) into the main
+    // scene submission so we don't fire a separate vkQueueSubmit2 + vc_flush() mprotect scan and leave a 13 ms GPU bubble.
     if (sync_submit) renderer_flush();
-    else renderer_submit();
+    else if (submit_empty || stat_draws != ll_d || stat_dispatches != ll_cs) renderer_submit();
 #ifdef __ANDROID__
     game_pending = false;
 #endif
