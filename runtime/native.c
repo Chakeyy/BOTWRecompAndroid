@@ -131,6 +131,10 @@ static uint64_t stub_svc(uint32_t *s, uint64_t at, uint64_t site, uint32_t imm) 
     memcpy(&s[10], &(uint64_t){(uint64_t)(uintptr_t)native_svc_gate}, 8);
     return 80;
 }
+static uint64_t g_cntfrq = 19200000;
+static uint64_t g_cnt_q = 1;
+static uint64_t g_cnt_mul = 0;  // ((19200000 % f) << 64) / f when host cntfrq_el0 != 19.2 MHz
+
 // mrs xN, tpidr_el0 / tpidrro_el0 (load) or msr tpidr_el0, xN (store): xN <-> [Cpu + off], the Cpu from g_native_tab
 static uint64_t stub_tls(uint32_t *s, uint64_t at, uint64_t site, int n, int off, bool store) {
     int t[3], k = 0;  // (three temporaries, none of them xN)
@@ -157,6 +161,36 @@ static uint64_t stub_tls(uint32_t *s, uint64_t at, uint64_t site, int n, int off
     s[17] = 0xD503201Fu;                                        // nop (the literal 8-aligned)
     memcpy(&s[18], &(uint64_t){(uint64_t)(uintptr_t)g_native_tab}, 8);
     return 80;
+}
+// mrs xN, cntpct_el0 when host cntfrq_el0 != 19.2 MHz (e.g. MediaTek Helio G99 at 13.0 MHz):
+// scales cntvct_el0 to 19.2 MHz via xN = cntvct * g_cnt_q + umulh(cntvct, g_cnt_mul) without touching NZCV flags.
+static uint64_t stub_cntpct(uint32_t *s, uint64_t at, uint64_t site, int n) {
+    if (n == 31) {
+        s[0] = enc_b(at, site + 4);
+        return 16;
+    }
+    int t[2], k = 0;
+    for (int r = 14; r <= 16 && k < 2; r++)
+        if (r != n) t[k++] = r;
+    int a = t[0], b = t[1];
+    s[0] = enc_stp_pre(a, b, SP, -16);                               // stp xa, xb, [sp, #-16]!
+    s[1] = MRS_CNTVCT | (uint32_t)n;                                 // mrs xN, cntvct_el0
+    s[2] = enc_ldr_lit(a, at + 8, at + 32);                          // ldr xa, =g_cnt_mul
+    s[3] = 0x9BC07C00u | (a << 16) | (n << 5) | b;                   // umulh xb, xN, xa
+    if (g_cnt_q == 1) {
+        s[4] = 0x8B000000u | (b << 16) | (n << 5) | n;               // add xN, xN, xb
+        s[5] = enc_ldp_post(a, b, SP, 16);                           // ldp xa, xb, [sp], #16
+        s[6] = enc_b(at + 24, site + 4);                             // b site + 4
+        s[7] = 0xD503201Fu;                                          // nop (8-byte align literal)
+    } else {
+        uint32_t q16 = (uint32_t)(g_cnt_q & 0xFFFFu);
+        s[4] = 0xD2800000u | (q16 << 5) | a;                         // movz xa, #g_cnt_q
+        s[5] = 0x9B000000u | (a << 16) | (b << 10) | (n << 5) | n;   // madd xN, xN, xa, xb
+        s[6] = enc_ldp_post(a, b, SP, 16);                           // ldp xa, xb, [sp], #16
+        s[7] = enc_b(at + 28, site + 4);                             // b site + 4
+    }
+    memcpy(&s[8], &g_cnt_mul, 8);
+    return 48;
 }
 
 // ---- the game's fixes (tools/patches.py, the same ones at the same addresses: there they are C in place of one
@@ -523,7 +557,8 @@ static void prepare_module(Module *m) {
     uint64_t nw = m->text_size / 4, nsites = 0;
     for (uint64_t i = 0; i < nw; i++) {
         uint32_t w = text[i];
-        if ((w & 0xFFE0001Fu) == 0xD4000001u || (w & ~31u) == MRS_TPIDR || (w & ~31u) == MRS_TPIDRRO || (w & ~31u) == MSR_TPIDR)
+        if ((w & 0xFFE0001Fu) == 0xD4000001u || (w & ~31u) == MRS_TPIDR || (w & ~31u) == MRS_TPIDRRO ||
+            (w & ~31u) == MSR_TPIDR || (g_cnt_mul && (w & ~31u) == MRS_CNTPCT))
             nsites++;
     }
     bool is_main = m->base == MAIN_BASE;
@@ -541,7 +576,10 @@ static void prepare_module(Module *m) {
         else if ((w & ~31u) == MRS_TPIDRRO) len = stub_tls((uint32_t *)(uintptr_t)at, at, site, w & 31, 288, false), ntls++;
         else if ((w & ~31u) == MRS_TPIDR) len = stub_tls((uint32_t *)(uintptr_t)at, at, site, w & 31, 280, false), ntls++;
         else if ((w & ~31u) == MSR_TPIDR) len = stub_tls((uint32_t *)(uintptr_t)at, at, site, w & 31, 280, true), ntls++;
-        else if ((w & ~31u) == MRS_CNTPCT) { text[i] = MRS_CNTVCT | (w & 31); ncnt++; continue; }
+        else if ((w & ~31u) == MRS_CNTPCT) {
+            if (!g_cnt_mul) { text[i] = MRS_CNTVCT | (w & 31); ncnt++; continue; }
+            len = stub_cntpct((uint32_t *)(uintptr_t)at, at, site, w & 31), ncnt++;
+        }
         if (!len) continue;
         text[i] = enc_b(site, at);
         at += len;
@@ -605,17 +643,31 @@ static void prepare_hle(void) {
 
 void native_prepare(void) {
     if (!native_on()) return;
-    uint64_t f;
+    uint64_t f = 0;
     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
+    if (f && f != 19200000ull) {
+        g_cntfrq = f;
+        g_cnt_q = 19200000ull / f;
+        g_cnt_mul = (uint64_t)((((__uint128_t)(19200000ull % f) << 64) + f - 1) / f);
+    } else {
+        g_cntfrq = 19200000ull;
+        g_cnt_q = 1;
+        g_cnt_mul = 0;
+    }
     LOG("[native] the game's code runs on the CPU (counter %llu Hz%s)\n", (unsigned long long)f,
-        f == 19200000 ? ", as the Switch's" : ": NOT the Switch's 19.2 MHz - the game's timing will be off");
+        f == 19200000 ? ", as the Switch's" : ", scaled in hardware stubs to Switch 19.2 MHz");
     memset(g_native_tab, 0, sizeof g_native_tab);
     for (int i = 0; i < g_nmodules; i++) prepare_module(&g_modules[i]);
     prepare_hle();
 }
 
 // The Switch's tick: the counter the rewritten reads see (rt_ticks, kernel.c)
-uint64_t native_ticks(void) { uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v)); return v; }
+uint64_t native_ticks(void) {
+    uint64_t v;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+    if (g_cnt_mul) v = v * g_cnt_q + (uint64_t)(((__uint128_t)v * g_cnt_mul) >> 64);
+    return v;
+}
 #else
 #include "rt.h"
 bool native_wanted(void) { return false; }

@@ -122,16 +122,27 @@ def _persp_get_aspect_182(gen, a):
             f'  /* {a:#x}: ldr s0, [x0, #0xb0] (projection aspect: widescreen; tools/patches.py) */')
 
 
+def _tag_check_null(gen, a):
+    w = struct.unpack_from('<I', gen.nso.image, a - gen.base)[0]
+    assert w == 0xf9404500, hex(w)  # ldr x0, [x8, #0x88]
+    return ('if (c->x[8] < 0x7000000000ull || c->x[8] >= (0x7000000000ull + 0x320000000ull)) { c->x[0] = 0; return; }'
+            '  /* (tools/patches.py) */ c->x[0] = LD64(c->x[8] + 0x88ull);')
+
+
+PATCHES[0x7000d5dce0] = _tag_check_null
+
 PATCHES_182[0x7000d811fc] = _frame_wait_182
 PATCHES_182[0x70014092f4] = _vfr_ratio_182
 PATCHES_182[0x7000da13f4] = _persp_matrix_182
 PATCHES_182[0x7000da13d8] = _persp_get_aspect_182
+PATCHES_182[0x70010f7eb8] = _tag_check_null
 
 # v1.9.0: the same code at other addresses (tools/port_addrs.py, from 1.8.2's; the words checked as above)
 PATCHES_190[0x7000e9487c] = _frame_wait_182
 PATCHES_190[0x700151d494] = _vfr_ratio_182
 PATCHES_190[0x7000eb4a44] = _persp_matrix_182
 PATCHES_190[0x7000eb4a28] = _persp_get_aspect_182
+PATCHES_190[0x700120bc48] = _tag_check_null
 
 
 def patches_for(build_id):

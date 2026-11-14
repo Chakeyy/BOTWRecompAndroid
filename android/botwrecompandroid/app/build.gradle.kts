@@ -15,14 +15,14 @@ val releaseKey: File = File(System.getProperty("user.home"), ".botwrecompandroid
 android {
     namespace = "com.botwrecompandroid"
     compileSdk = 36
-    ndkVersion = "30.0.16248370"
+    ndkVersion = System.getenv("ANDROID_NDK_VERSION") ?: "28.2.13676358"
 
     defaultConfig {
         applicationId = "com.botwrecomp.android"
         minSdk = 30
         targetSdk = 36
-        versionCode = 39
-        versionName = "0.4.0-beta"
+        versionCode = 40
+        versionName = "0.4.0-r01"
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -36,7 +36,7 @@ android {
     externalNativeBuild {
         cmake {
             path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.30.4"
+            version = System.getenv("ANDROID_CMAKE_VERSION") ?: "3.22.1"
         }
     }
 

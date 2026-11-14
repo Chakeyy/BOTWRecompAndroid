@@ -1,0 +1,156 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Configure Android SDK, NDK, and CMake
+        run: |
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SM" --licenses >/dev/null || true
+          NDK_VER=$(ls -1 "$SDK/ndk" 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -z "$NDK_VER" ] || [ "${NDK_VER%%.*}" -lt 27 ]; then
+            NDK_VER="28.2.13676358"
+            "$SM" --install "ndk;$NDK_VER"
+          fi
+          CMAKE_VER=$(ls -1 "$SDK/cmake" 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -z "$CMAKE_VER" ]; then
+            CMAKE_VER="3.22.1"
+            "$SM" --install "cmake;$CMAKE_VER"
+          fi
+          "$SM" --install "platforms;android-36" "build-tools;35.0.0"
+          echo "ANDROID_NDK_VERSION=$NDK_VER" >> "$GITHUB_ENV"
+          echo "ANDROID_CMAKE_VERSION=$CMAKE_VER" >> "$GITHUB_ENV"
+          echo "Using NDK=$NDK_VER CMake=$CMAKE_VER"
+
+      - name: Cache prebuilt dependencies and headers
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: android/deps/out
+          key: botw-prebuilt-deps-v0.4.0-beta-v3
+
+      - name: Populate android/deps/out from upstream APK and header tarballs
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/deps_work"
+          OUT="$GITHUB_WORKSPACE/android/deps/out"
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          TC="$SDK/ndk/$ANDROID_NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          rm -rf "$WORK" "$OUT"
+          mkdir -p "$WORK" "$OUT"/{include/vma,lib,volk,fonts,java/org/libsdl,gen/zig/lib,gen/python/lib,gen/lib,gen/site}
+
+          # 1. Extract prebuilt .so libraries, font, and gen/ runtime assets from upstream v0.4.0-beta APK
+          curl -fsSL -o "$WORK/upstream.apk" "https://github.com/mamcjr/BOTWRecompAndroid/releases/download/v0.4.0-beta/BOTWRecompAndroid-0.4.0-beta.apk"
+          unzip -q "$WORK/upstream.apk" -d "$WORK/apk"
+          for l in libSDL3.so libshaderc_shared.so libavcodec.so libavformat.so libavutil.so libswscale.so; do
+            cp "$WORK/apk/lib/arm64-v8a/$l" "$OUT/lib/"
+          done
+          cp "$WORK/apk/lib/arm64-v8a/libzig.so" "$OUT/gen/zig/"
+          cp "$WORK/apk/lib/arm64-v8a/libpymain.so" "$WORK/apk/lib/arm64-v8a/libpython3.14.so" "$OUT/gen/python/"
+          for l in libcapstone.so libunicorn.so liblz4.so; do
+            cp "$WORK/apk/lib/arm64-v8a/$l" "$OUT/gen/lib/"
+          done
+          cp "$WORK/apk/assets/res/DejaVuSans.ttf" "$OUT/fonts/"
+          cp -r "$WORK/apk/assets/gen/python/lib/." "$OUT/gen/python/lib/"
+          cp -r "$WORK/apk/assets/gen/site/." "$OUT/gen/site/"
+          cp -r "$WORK/apk/assets/gen/zig/lib/." "$OUT/gen/zig/lib/"
+
+          # 2. Download & unpack upstream headers and SDL3 Java glue
+          fetch() {
+            curl -fsSL -o "$WORK/$3" "$1"
+            (cd "$WORK" && echo "$2  $3" | sha256sum -c --quiet)
+          }
+
+          fetch https://github.com/libsdl-org/SDL/releases/download/release-3.4.16/SDL3-3.4.16.tar.gz \
+                7322236cd12090c3eb40b9728be4d49c76f66ad17d04369584d4ecad5cf77c68 SDL3-3.4.16.tar.gz
+          mkdir -p "$WORK/sdl" && tar -xzf "$WORK/SDL3-3.4.16.tar.gz" -C "$WORK/sdl" --strip-components 1
+          cp -r "$WORK/sdl/include/SDL3" "$OUT/include/"
+          if [ ! -f "$OUT/include/SDL3/SDL_revision.h" ]; then
+            printf '#define SDL_REVISION "SDL-release-3.4.16"\n' > "$OUT/include/SDL3/SDL_revision.h"
+          fi
+          cp -r "$WORK/sdl/android-project/app/src/main/java/org/libsdl/app" "$OUT/java/org/libsdl/"
+
+          fetch https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.350.1.tar.gz \
+                6d1bb65e49520344cc0a48af3dc02e993781efff14c7ebdcb8ae9fa23ddf7e83 Vulkan-Headers-1.4.350.1.tar.gz
+          mkdir -p "$WORK/vkh" && tar -xzf "$WORK/Vulkan-Headers-1.4.350.1.tar.gz" -C "$WORK/vkh" --strip-components 1
+          cp -r "$WORK/vkh/include/vulkan" "$WORK/vkh/include/vk_video" "$OUT/include/"
+
+          fetch https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/archive/refs/tags/v3.3.0.tar.gz \
+                c4f6bbe6b5a45c2eb610ca9d231158e313086d5b1a40c9922cb42b597419b14e VulkanMemoryAllocator-3.3.0.tar.gz
+          mkdir -p "$WORK/vma" && tar -xzf "$WORK/VulkanMemoryAllocator-3.3.0.tar.gz" -C "$WORK/vma" --strip-components 1
+          cp "$WORK/vma/include/vk_mem_alloc.h" "$OUT/include/vma/"
+
+          fetch https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.4.350.1.tar.gz \
+                078a9411298e4e0f60f5f5398c890783427c25a414619294ca8e69587bbd5eae volk-1.4.350.1.tar.gz
+          mkdir -p "$WORK/volk" && tar -xzf "$WORK/volk-1.4.350.1.tar.gz" -C "$WORK/volk" --strip-components 1
+          cp "$WORK/volk/volk.h" "$WORK/volk/volk.c" "$WORK/volk/LICENSE.md" "$OUT/volk/"
+
+          fetch https://github.com/google/shaderc/archive/refs/tags/v2026.3.tar.gz \
+                ee493ccf1b3038b4ef2fe024664c5eb2dc4bcc1f6b05b33e3909de0e19c81024 shaderc-2026.3.tar.gz
+          mkdir -p "$WORK/shaderc" && tar -xzf "$WORK/shaderc-2026.3.tar.gz" -C "$WORK/shaderc" --strip-components 1
+          mkdir -p "$OUT/include/shaderc"
+          cp "$WORK/shaderc/libshaderc/include/shaderc/"*.h "$OUT/include/shaderc/"
+
+          fetch https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz \
+                8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e ffmpeg-9.0.2.tar.xz
+          mkdir -p "$WORK/ffmpeg" "$WORK/ffprefix" && tar -xf "$WORK/ffmpeg-9.0.2.tar.xz" -C "$WORK/ffmpeg" --strip-components 1
+          (
+            cd "$WORK/ffmpeg"
+            ./configure --prefix="$WORK/ffprefix" --enable-cross-compile --target-os=android --arch=aarch64 --cpu=armv8-a \
+              --cc="$TC/aarch64-linux-android30-clang" --cxx="$TC/aarch64-linux-android30-clang++" \
+              --nm="$TC/llvm-nm" --ar="$TC/llvm-ar" --ranlib="$TC/llvm-ranlib" --strip="$TC/llvm-strip" \
+              --enable-shared --disable-static --enable-pic \
+              --disable-autodetect --disable-programs --disable-doc --disable-network --disable-avdevice --disable-avfilter \
+              --disable-swresample --disable-everything --disable-asm
+            make install-headers
+          )
+          cp -r "$WORK/ffprefix/include/"* "$OUT/include/"
+          rm -rf "$WORK"
+
+      - name: Build Release APK
+        run: |
+          cd android/botwrecompandroid
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Stage APK artifact
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          APK_SRC=$(find android/botwrecompandroid/app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          if [ -z "$APK_SRC" ] || [ ! -f "$APK_SRC" ]; then
+            echo "Built APK not found!"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/out_apk"
+          cp "$APK_SRC" "$RUNNER_TEMP/out_apk/BOTWRecomp-r01-${SHORT_SHA}.apk"
+          echo "APK_ARTIFACT_NAME=BOTWRecomp-r01-${SHORT_SHA}" >> "$GITHUB_ENV"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APK_ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/out_apk/*.apk
+          if-no-files-found: error

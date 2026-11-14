@@ -1079,6 +1079,86 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
     }
 }
 
+#ifdef __ANDROID__
+#define DESC_BANKS 4
+#define DESC_BANK_MAX_SETS 6144
+typedef struct {
+    VkDescriptorPool pool;
+    uint32_t used;
+    uint32_t epoch;
+    uint64_t last_seq;
+} DescBank;
+static DescBank desc_banks[DESC_BANKS];
+static int cur_desc_bank;
+static uint32_t desc_res_gen = 1;
+
+static VkDescriptorSet persist_alloc_set(VkDescriptorSetLayout layout, int *bank_out) {
+    for (int tries = 0; tries < DESC_BANKS; tries++) {
+        DescBank *b = &desc_banks[cur_desc_bank];
+        if (!b->pool) {
+            VkDescriptorPoolSize sizes[] = {
+                {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 24576},
+                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
+                {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
+                {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024},
+                {VK_DESCRIPTOR_TYPE_SAMPLER, 1024},
+                {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 24576}
+            };
+            VkDescriptorPoolCreateInfo ci = {
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                .maxSets = DESC_BANK_MAX_SETS,
+                .poolSizeCount = 6,
+                .pPoolSizes = sizes
+            };
+            VK_CHECK(vkCreateDescriptorPool(g_vk.dev, &ci, NULL, &b->pool));
+            b->epoch = 1;
+            b->used = 0;
+            b->last_seq = 0;
+        }
+        if (b->used < DESC_BANK_MAX_SETS) {
+            VkDescriptorSetAllocateInfo ai = {
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                .descriptorPool = b->pool,
+                .descriptorSetCount = 1,
+                .pSetLayouts = &layout
+            };
+            VkDescriptorSet set;
+            if (vkAllocateDescriptorSets(g_vk.dev, &ai, &set) == VK_SUCCESS) {
+                b->used++;
+                *bank_out = cur_desc_bank;
+                return set;
+            }
+        }
+        int next = (cur_desc_bank + 1) % DESC_BANKS;
+        DescBank *nb = &desc_banks[next];
+        if (nb->pool) {
+            if (nb->last_seq > submit_seq) { cur_desc_bank = next; continue; }
+            if (nb->last_seq) vk_wait_seq(nb->last_seq);
+            VK_CHECK(vkResetDescriptorPool(g_vk.dev, nb->pool, 0));
+            nb->used = 0;
+            nb->epoch++;
+            if (!nb->epoch) nb->epoch = 1;
+        }
+        cur_desc_bank = next;
+    }
+    *bank_out = -1;
+    return vk_alloc_set(layout);
+}
+
+static void desc_bank_reset_all(void) {
+    desc_res_gen++;
+    for (int i = 0; i < DESC_BANKS; i++) {
+        if (desc_banks[i].pool) {
+            VK_CHECK(vkResetDescriptorPool(g_vk.dev, desc_banks[i].pool, 0));
+            desc_banks[i].used = 0;
+            desc_banks[i].last_seq = 0;
+            desc_banks[i].epoch++;
+            if (!desc_banks[i].epoch) desc_banks[i].epoch = 1;
+        }
+    }
+}
+#endif
+
 // ================================================================== transient memory ring
 // 64 MB host-visible chunks (device-local when the GPU exposes resizable BAR); a chunk is reused once every
 // submission that allocated from it has completed, and given back after 10 s unused (down to RING_KEEP of them).
@@ -1156,6 +1236,9 @@ VkSpan vk_transient(uint64_t size, uint64_t align) {
     for (int i = nchunks - 1; i >= 0 && nchunks > RING_KEEP; i--) {
         if (i == active || chunks[i].seq > done || now - chunks[i].frame < 300) continue;
         vmaDestroyBuffer(g_vk.vma, chunks[i].buf, chunks[i].mem);
+#ifdef __ANDROID__
+        desc_res_gen++;
+#endif
         chunks[i] = chunks[--nchunks];
         if (active == nchunks) active = i;
     }
@@ -1277,6 +1360,10 @@ static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
 
 static void *worker(void *a) {
     (void)a;
+#ifdef __ANDROID__
+    extern void plat_worker_thread_pin(void);
+    plat_worker_thread_pin();
+#endif
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
@@ -1304,6 +1391,10 @@ static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
 static void *translator(void *a) {
     (void)a;
+#ifdef __ANDROID__
+    extern void plat_worker_thread_pin(void);
+    plat_worker_thread_pin();
+#endif
     for (;;) {
         pthread_mutex_lock(&tjobs_lock);
         while (!tjobs_head) pthread_cond_wait(&tjobs_cond, &tjobs_lock);
@@ -1340,7 +1431,7 @@ static void run_job(void (*fn)(void *), void *arg) {
         int n = cores - 4;
 #ifdef __ANDROID__
         n = cores / 2;
-        if (n > 4) n = 4;  // leave CPU capacity for the game and Vulkan translation
+        if (n > 3) n = 3;  // leave CPU capacity on Little cores and keep Big cores free
 #endif
         const char *workers = getenv("LARECOMP_SHADER_WORKERS");
         if (workers) n = atoi(workers);
@@ -1398,7 +1489,10 @@ static bool rt_one_off(NvnTexture *t, uint64_t frame) {
 // LARECOMP_WAIT_NO_DEPTH=0: only the one-off ones, as before.
 static bool wait_no_depth(void) {
     static int on = -1;
-    if (on < 0) on = !getenv("LARECOMP_WAIT_NO_DEPTH") || atoi(getenv("LARECOMP_WAIT_NO_DEPTH"));
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_WAIT_NO_DEPTH");
+        on = e ? atoi(e) != 0 : (g_vk.props.vendorID != 0x13B5);
+    }
     return on;
 }
 
@@ -3186,7 +3280,21 @@ static int pipe_keep(void) {
         const char *e = getenv("LARECOMP_PIPE_KEEP");
         // (every GPU but Adreno's: an Xclipse 530 reached 8165 pipelines and 1.6 GB of malloc in an hour, an Xclipse 540
         // 4375 in 10 minutes, killed for low memory - #327 #345; Turnip's cost little each)
-        keep = e ? atoi(e) : (g_vk.props.vendorID != 0x5143 || vk_low_ram()) ? 1500 : 0;
+        if (e) {
+            keep = atoi(e);
+        } else if (g_vk.props.vendorID == 0x5143 && !vk_low_ram()) {
+            keep = 0;
+        } else if (!vk_low_ram()) {
+            long total_kb = 0;
+            FILE *f = fopen("/proc/meminfo", "r");
+            if (f) {
+                if (fscanf(f, "MemTotal: %ld kB", &total_kb) != 1) total_kb = 0;
+                fclose(f);
+            }
+            keep = (total_kb >= 7L * 1024 * 1024) ? 4096 : 1500;
+        } else {
+            keep = 800;
+        }
         if (keep > 0) LOG("[vk] pipelines kept: at most %d (the least recently used ones destroyed)\n", keep);
     }
     return keep;
@@ -3206,8 +3314,8 @@ static void pipe_evict(void) {
     if (live <= keep) return;
     uint64_t done = vk_completed_seq();
     int target = keep * 4 / 5, gone = 0;
-    // oldest first: two passes, the unused for 2 minutes, then for 30 s
-    static const uint64_t ages[2] = {120000000000ull, 30000000000ull};
+    // oldest first: two passes, the unused for 10 minutes, then for 3 minutes
+    static const uint64_t ages[2] = {600000000000ull, 180000000000ull};
     for (int pass = 0; pass < 2 && live > target; pass++) {
         uint64_t age = ages[pass];
         for (size_t i = 0; i < pipe_cache.capacity && live > target; i++) {
@@ -4464,6 +4572,9 @@ static bool gmem_import(uint64_t size) {
         vk_wait_seq(submit_seq);
         vkDestroyBuffer(g_vk.dev, gmem_buf, NULL);
         vkFreeMemory(g_vk.dev, gmem_mem, NULL);
+#ifdef __ANDROID__
+        desc_res_gen++;
+#endif
     }
     gmem_buf = buf;
     gmem_mem = mem;
@@ -5857,6 +5968,7 @@ void vk_exec_reset(void) {
 #ifdef __ANDROID__
     gcopy_mode = !g_vk.host_import && !getenv("LARECOMP_VK_NO_GCOPY");  // (until the next heap is placed: vk_heap_place)
     gres_reset();  // (the arena's resident ranges: keyed by the old heap's addresses)
+    desc_bank_reset_all();
 #endif
     pthread_mutex_lock(&wb_lock);
     for (int i = 0; i < WB_SLOTS; i++) wb_ent[i].busy = false;
@@ -6122,20 +6234,36 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             else { DS_MIX((uintptr_t)w[i].pBufferInfo->buffer); DS_MIX(w[i].pBufferInfo->offset); DS_MIX(w[i].pBufferInfo->range); }
         }
 #undef DS_MIX
-        static struct { uint64_t seq, h1, h2; VkDescriptorSet ds; } cache[4096];
-        uint64_t seq = vk_pending_seq();
-        uint32_t slot = (uint32_t)(h1 ^ (h1 >> 32)) & 4095;
-        if (!off && cache[slot].seq == seq && cache[slot].h1 == h1 && cache[slot].h2 == h2) {
-            prof_set_hits++;
-            return cache[slot].ds;
+        extern uint32_t vk_view_gen;
+        typedef struct {
+            uint64_t h1, h2;
+            VkDescriptorSet ds;
+            uint32_t epoch, rgen, vgen;
+            int8_t bank;
+        } SetCacheEnt;
+        static SetCacheEnt cache[8192];
+        uint64_t pending = vk_pending_seq();
+        uint32_t slot = (uint32_t)(h1 ^ (h1 >> 32)) & 8191;
+        SetCacheEnt *e = &cache[slot];
+        if (!off && e->ds && e->h1 == h1 && e->h2 == h2 && e->rgen == desc_res_gen && e->vgen == vk_view_gen) {
+            if (e->bank >= 0 && desc_banks[(int)e->bank].epoch == e->epoch) {
+                desc_banks[(int)e->bank].last_seq = pending;
+                prof_set_hits++;
+                return e->ds;
+            }
         }
         prof_set_miss++;
         uint64_t tw_ = prof > 0 ? plat_now_ns() : 0;
-        ds = vk_alloc_set(layout);
+        int bank = -1;
+        ds = persist_alloc_set(layout, &bank);
         for (int i = 0; i < n; i++) w[i].dstSet = ds;
         if (n) vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL);
         if (prof > 0) prof_dsw += plat_now_ns() - tw_;
-        cache[slot].seq = seq, cache[slot].h1 = h1, cache[slot].h2 = h2, cache[slot].ds = ds;
+        if (bank >= 0) {
+            desc_banks[bank].last_seq = pending;
+            *e = (SetCacheEnt){.h1 = h1, .h2 = h2, .ds = ds, .epoch = desc_banks[bank].epoch,
+                               .rgen = desc_res_gen, .vgen = vk_view_gen, .bank = (int8_t)bank};
+        }
         return ds;
     }
 #else

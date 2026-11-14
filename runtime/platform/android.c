@@ -189,6 +189,7 @@ bool plat_reserve_guest(uint64_t lo, uint64_t hi) {
         }
         g_guest_lo = base;
         fprintf(stderr, "[android] guest window %#llx-%#llx\n", (unsigned long long)base, (unsigned long long)(base + hi - lo));
+        fprintf(stderr, "[BOTW-Opt r01] Helio G99 / Mali-G57 Optimization Suite Active\n");
         const char *last = getenv("LARECOMP_LAST_EXIT");  // (the activity: ApplicationExitInfo)
         if (last && *last) fprintf(stderr, "[android] the last run ended: %s\n", last);
         const char *boot = getenv("LARECOMP_BOOT_STATE");
@@ -903,8 +904,7 @@ static void uclamp_min_thread(void) {
 // (vulkan/exec.c vk_low_ram - the weak phones); LARECOMP_RENDER_BIG=1 / 0.
 void plat_render_thread_pin(void) {
     const char *e = getenv("LARECOMP_RENDER_BIG");
-    extern bool vk_low_ram(void);
-    if (e ? !atoi(e) : !vk_low_ram()) return;
+    if (e && !atoi(e)) return;
     long best = 0, mhz[64] = {0};
     int n = 0;
     for (int c = 0; c < 64; c++) {
@@ -933,6 +933,33 @@ void plat_render_thread_pin(void) {
 void plat_thread_unpin(void) {
     if (g_pinned) sched_setaffinity(0, sizeof g_all_cores, &g_all_cores);
     uclamp_min_thread();
+}
+
+void plat_worker_thread_pin(void) {
+    const char *e = getenv("LARECOMP_WORKER_LITTLE");
+    if (e && !atoi(e)) return;
+    long best = 0, mhz[64] = {0};
+    int n = 0;
+    for (int c = 0; c < 64; c++) {
+        char path[96];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+        FILE *f = fopen(path, "re");
+        if (!f) continue;
+        if (fscanf(f, "%ld", &mhz[c]) != 1) mhz[c] = 0;
+        fclose(f);
+        if (mhz[c] > best) best = mhz[c];
+        n = c + 1;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    int k = 0;
+    for (int c = 0; c < n; c++)
+        if (mhz[c] > 0 && mhz[c] < best) {
+            CPU_SET(c, &set);
+            k++;
+        }
+    if (best && k > 0) sched_setaffinity(0, sizeof set, &set);
+    setpriority(PRIO_PROCESS, 0, 10);
 }
 
 static void pin_to_fastest_cores(void) {
