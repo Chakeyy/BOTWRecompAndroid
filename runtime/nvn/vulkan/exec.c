@@ -1343,8 +1343,8 @@ bool vk_conserve_ram(void) {
     }
     return cons;
 }
-#define CHUNK_SIZE (vk_low_ram() ? 16ull << 20 : 64ull << 20)
-#define RING_KEEP (vk_low_ram() ? 2 : vk_conserve_ram() ? 3 : 4)
+#define CHUNK_SIZE (vk_low_ram() ? 16ull << 20 : vk_conserve_ram() ? 32ull << 20 : 64ull << 20)
+#define RING_KEEP (vk_conserve_ram() ? 2 : 4)
 typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t size, used, seq, frame; } Chunk;  // frame: last picked
 static Chunk *chunks;
 static int nchunks, active = -1;
@@ -2664,6 +2664,84 @@ static bool no_chunks_now(void) {
     extern bool framepace_in_menu(void);
     return !keep && framepace_in_menu();
 }
+
+static TexBackend *pend_clear_list[32];
+static int n_pend_clear;
+
+void vk_pend_clear_forget(TexBackend *b) {
+    if (!b) return;
+    b->pend_clear_color = b->pend_clear_depth = b->pend_clear_stencil = false;
+    for (int i = n_pend_clear - 1; i >= 0; i--) {
+        if (pend_clear_list[i] == b) pend_clear_list[i] = pend_clear_list[--n_pend_clear];
+    }
+}
+
+static void pend_clear_add(TexBackend *b) {
+    if (!b) return;
+    for (int i = 0; i < n_pend_clear; i++) if (pend_clear_list[i] == b) return;
+    if (n_pend_clear == 32) vk_flush_tex_clear(pend_clear_list[0]);
+    if (n_pend_clear < 32) pend_clear_list[n_pend_clear++] = b;
+}
+
+void vk_flush_tex_clear(TexBackend *b) {
+    if (!b || (!b->pend_clear_color && !b->pend_clear_depth && !b->pend_clear_stencil)) {
+        vk_pend_clear_forget(b);
+        return;
+    }
+    bool do_c = b->pend_clear_color;
+    bool do_d = b->pend_clear_depth;
+    bool do_s = b->pend_clear_stencil;
+    float cc[4], cd = b->clear_depth;
+    memcpy(cc, b->clear_color, 16);
+    uint32_t cs = b->clear_stencil;
+    vk_pend_clear_forget(b);
+    if (!b->image) return;
+    if (in_pass) {
+        vk_end_pass();
+        st.rt_dirty = true;
+    }
+    VkCommandBuffer cb = vk_cmd();
+    if (vk_narrow_pass_barrier_on() && !g_pass_wrote_non_rt && !naliases) vk_pass_barrier_fragment(cb);
+    else vk_full_barrier(cb);
+    if (do_c && (b->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
+        VkClearColorValue cv;
+        memcpy(cv.float32, cc, 16);
+        VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &rg);
+        g_pass_wrote_non_rt = true;
+        g_gpu_write_serial++;
+    }
+    if ((do_d || do_s) && (b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) {
+        VkImageAspectFlags asp = (do_d ? (b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) : 0) |
+                                 (do_s ? (b->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) : 0);
+        if (asp) {
+            VkClearDepthStencilValue dsv = {cd, cs};
+            VkImageSubresourceRange rg = {asp, 0, 1, 0, 1};
+            vkCmdClearDepthStencilImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &dsv, 1, &rg);
+            g_pass_wrote_non_rt = true;
+            g_gpu_write_serial++;
+        }
+    }
+}
+
+static void vk_flush_all_pending_clears(void) {
+    while (n_pend_clear > 0) vk_flush_tex_clear(pend_clear_list[n_pend_clear - 1]);
+}
+
+static void sync_rt_scale(void) {
+    NvnTexture *all[9];
+    int n = 0;
+    for (int i = 0; i < st.rt.ncolor && i < 8; i++) if (st.rt.color[i]) all[n++] = st.rt.color[i];
+    if (st.rt.depth) all[n++] = st.rt.depth;
+    for (int i = 0; i < n; i++) {
+        if (!renderer_texture_scalable(all[i])) continue;
+        for (int k = 0; k < n; k++)
+            if (all[k]->width == all[i]->width && all[k]->height == all[i]->height) vk_make_scalable_like(all[k], all[i]);
+        break;
+    }
+}
+
+static void alias_before_write(NvnTexture *t, VkImageAspectFlags full, const char *why);
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     pipeline_dirty = true;
@@ -2715,6 +2793,34 @@ static void begin_pass(void) {
     }
 #endif
     if (dl_on == 2) renderer_flush();  // (LARECOMP_VK_DEVLOST_TRACE=2: each pass its own submission)
+    if (naliases && g_cur_rec) {
+        const CmdRec *q = g_cur_rec;
+        for (int k = 0; k < 16 && q->size; k++) {
+            if (q->op == CMD_CLEAR_COLOR) {
+                int idx = (int)q->x[0];
+                if (idx >= 0 && idx < st.rt.ncolor && st.rt.color[idx])
+                    alias_before_write(st.rt.color[idx], 0, "clear");
+            } else if (q->op == CMD_CLEAR_DEPTH_STENCIL) {
+                if (st.rt.depth) {
+                    NvnTexture *d = st.rt.depth;
+                    bool whole = st.scissor[0][0] <= 0 && st.scissor[0][1] <= 0 &&
+                                 (int64_t)st.scissor[0][0] + st.scissor[0][2] >= (int64_t)d->width &&
+                                 (int64_t)st.scissor[0][1] + st.scissor[0][3] >= (int64_t)d->height &&
+                                 !(st.rt.has_dview && (((st.rt.dview.setmask & 1) && st.rt.dview.base_level) ||
+                                                       ((st.rt.dview.setmask & 2) && st.rt.dview.min_layer)));
+                    for (int i = 0; i < st.rt.ncolor; i++)
+                        if (st.rt.color[i] && (st.rt.color[i]->width < d->width || st.rt.color[i]->height < d->height))
+                            whole = false;
+                    VkImageAspectFlags full = 0;
+                    if (whole && q->x[0] != 0) full |= VK_IMAGE_ASPECT_DEPTH_BIT;
+                    if (whole && renderer_format_has_stencil(d->format) && (q->x[2] & 0xFF) == 0xFF) full |= VK_IMAGE_ASPECT_STENCIL_BIT;
+                    if (!renderer_format_has_stencil(d->format)) full |= VK_IMAGE_ASPECT_STENCIL_BIT;
+                    alias_before_write(d, full, "clear");
+                }
+            } else break;
+            q = (const CmdRec *)((const uint8_t *)q + q->size);
+        }
+    }
 #ifdef __ANDROID__
     vk_bc_shadows_resolve(st.rt.color, st.rt.cview, st.rt.has_cview, st.rt.ncolor);  // (BC textures drawn into before: decoded, unless this pass draws on)
 #endif
@@ -2739,19 +2845,7 @@ static void begin_pass(void) {
         gp_mark(cb, "pass: %d color %ux%u fmt %#x, depth %s", st.rt.ncolor, t0 ? t0->width : 0, t0 ? t0->height : 0,
                 t0 ? t0->format : 0, st.rt.depth ? "yes" : "no");
     }
-    {   // one scale for the pass: attachments the size of a scaled one are scaled too (BOTW's G-buffer mixes
-        // targets the scaling rule takes and ones it does not; the unscaled ones got only part of the pass)
-        NvnTexture *all[9];
-        int n = 0;
-        for (int i = 0; i < st.rt.ncolor && i < 8; i++) if (st.rt.color[i]) all[n++] = st.rt.color[i];
-        if (st.rt.depth) all[n++] = st.rt.depth;
-        for (int i = 0; i < n; i++) {
-            if (!renderer_texture_scalable(all[i])) continue;
-            for (int k = 0; k < n; k++)
-                if (all[k]->width == all[i]->width && all[k]->height == all[i]->height) vk_make_scalable_like(all[k], all[i]);
-            break;
-        }
-    }
+    sync_rt_scale();
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
     uint32_t w = 0, minw = UINT32_MAX, minh = UINT32_MAX;  // w: first attachment seen
     pass_ncolor = (uint32_t)st.rt.ncolor;
@@ -2858,6 +2952,46 @@ static void begin_pass(void) {
     }
     if (!w) { pass_sx = pass_sy = 1; minw = minh = 16; }
     pass_w = minw; pass_h = minh;
+    if (n_pend_clear) {
+        for (int i = 0; i < st.rt.ncolor; i++) {
+            NvnTexture *t = st.rt.color[i];
+            TexBackend *b = t ? t->backend : NULL;
+            if (!b || !b->pend_clear_color || !ca[i].imageView) continue;
+            uint32_t lv = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 1) ? st.rt.cview[i].base_level : 0;
+            uint32_t ly = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 2) ? st.rt.cview[i].min_layer : 0;
+            if (lv == 0 && ly == 0 && b->layers == 1 && b->depth == 1 && b->width == minw && b->height == minh) {
+                ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                memcpy(ca[i].clearValue.color.float32, b->clear_color, 16);
+                vk_pend_clear_forget(b);
+            }
+        }
+        if (st.rt.depth && st.rt.depth->backend) {
+            TexBackend *b = st.rt.depth->backend;
+            uint32_t lv = st.rt.has_dview && (st.rt.dview.setmask & 1) ? st.rt.dview.base_level : 0;
+            uint32_t ly = st.rt.has_dview && (st.rt.dview.setmask & 2) ? st.rt.dview.min_layer : 0;
+            if ((b->pend_clear_depth || b->pend_clear_stencil) && lv == 0 && ly == 0 && b->layers == 1 && b->depth == 1 &&
+                b->width == minw && b->height == minh) {
+                if (b->pend_clear_depth && has_d) {
+                    da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                    da.clearValue.depthStencil.depth = b->clear_depth;
+                    b->pend_clear_depth = false;
+                }
+                if (b->pend_clear_stencil && has_s) {
+                    sa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                    sa.clearValue.depthStencil.stencil = b->clear_stencil;
+                    b->pend_clear_stencil = false;
+                }
+                if (!b->pend_clear_depth && !b->pend_clear_stencil) vk_pend_clear_forget(b);
+            }
+        }
+        if (n_pend_clear) {
+            vk_flush_all_pending_clears();
+            cb = vk_cmd();
+            if (vk_narrow_pass_barrier_on() && !naliases) vk_pass_barrier_fragment(cb);
+            else vk_full_barrier(cb);
+            g_pass_wrote_non_rt = false;
+        }
+    }
     // A pass that begins with clears of whole attachments (BOTW's G-buffer, its light buffers): their load operations
     // clear instead. Loaded and then cleared by vkCmdClearAttachments, a tiler read each attachment from memory into
     // every bin first, for nothing. Only the clears right at the start, one after another (the same scissor), each over
@@ -2869,7 +3003,7 @@ static void begin_pass(void) {
         static int off = -1;
         if (off < 0) off = getenv("LARECOMP_NO_CLEAR_LOAD") != NULL;
         const CmdRec *q = g_cur_rec;
-        if (!off && AB("clrload") != 0 && !naliases && q && (q->op == CMD_CLEAR_COLOR || q->op == CMD_CLEAR_DEPTH_STENCIL) &&
+        if (!off && AB("clrload") != 0 && q && (q->op == CMD_CLEAR_COLOR || q->op == CMD_CLEAR_DEPTH_STENCIL) &&
             w && minw != UINT32_MAX) {
             float s0 = vp_sx, s1 = vp_sy, s2 = vp_ox, s3 = vp_oy;
             vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
@@ -3209,11 +3343,83 @@ static VkPipeline clear_pipeline(int index, int kind, uint32_t mask, bool depth,
     return p;
 }
 
+static bool try_defer_clear(int index, int kind, const void *color, uint32_t mask, bool depth, float dval,
+                            bool stencil, uint32_t sval, uint32_t smask) {
+    static int off = -1;
+    if (off < 0) off = getenv("LARECOMP_NO_DEFER_CLEAR") != NULL;
+    if (off || g_debug_frame || (in_pass && !st.rt_dirty)) return false;
+    NvnTexture *t = index >= 0 ? (index < st.rt.ncolor ? st.rt.color[index] : NULL) : st.rt.depth;
+    if (!t || t->target != 1 || t->depth > 1 || t->layout.layers > 1 || t->samples > 1) return false;
+    if (index >= 0) {
+        if ((mask & 0xF) != 0xF) return false;
+        if (st.rt.has_cview[index] && ((st.rt.cview[index].setmask & 1) && st.rt.cview[index].base_level)) return false;
+        if (st.rt.has_cview[index] && ((st.rt.cview[index].setmask & 2) && st.rt.cview[index].min_layer)) return false;
+    } else {
+        if (!renderer_format_is_depth(t->format)) return false;
+        if (stencil && (smask & 0xFF) != 0xFF) return false;
+        if (st.rt.has_dview && ((st.rt.dview.setmask & 1) && st.rt.dview.base_level)) return false;
+        if (st.rt.has_dview && ((st.rt.dview.setmask & 2) && st.rt.dview.min_layer)) return false;
+    }
+    if (st.scissor[0][0] > 0 || st.scissor[0][1] > 0 ||
+        (int64_t)st.scissor[0][0] + st.scissor[0][2] < (int64_t)t->width ||
+        (int64_t)st.scissor[0][1] + st.scissor[0][3] < (int64_t)t->height)
+        return false;
+    for (int i = 0; i < st.rt.ncolor; i++)
+        if (st.rt.color[i] && (st.rt.color[i]->width < t->width || st.rt.color[i]->height < t->height))
+            return false;
+    if (st.rt.depth && (st.rt.depth->width < t->width || st.rt.depth->height < t->height))
+        return false;
+    if (in_pass) vk_end_pass();
+    sync_rt_scale();
+    TexBackend *b = vk_tex(t, true);
+    if (!b || !b->image || b->layers != 1 || b->depth != 1 || b->samples != 1) return false;
+    if (index >= 0) {
+        if (b->bc_vf != VK_FORMAT_UNDEFINED || wb_eligible(t, b, 0)) return false;
+        if (st.rt.has_cview[index] && (st.rt.cview[index].setmask & 4) &&
+            vk_format(t->format) != b->format && rt_kind(st.rt.cview[index].format) != rt_kind(t->format))
+            return false;
+        (void)kind;
+        renderer_mark_gpu_owned(t);
+        renderer_texture_first_write(t);
+        renderer_texture_level_fresh(t);
+        renderer_texture_frame_fresh(t);
+        b->rendered_serial = ++g_gpu_write_serial;
+        memcpy(b->clear_color, color, 16);
+        b->pend_clear_color = true;
+        pend_clear_add(b);
+        return true;
+    }
+    renderer_mark_gpu_owned(t);
+    b->rendered_serial = ++g_gpu_write_serial;
+    if (depth && (b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) {
+        b->pend_clear_depth = true;
+        b->clear_depth = dval;
+    }
+    if (stencil && (b->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) {
+        b->pend_clear_stencil = true;
+        b->clear_stencil = sval;
+    }
+    if (b->pend_clear_depth || b->pend_clear_stencil) pend_clear_add(b);
+    return true;
+}
+
 static void clear(int index, int kind, const void *color, uint32_t mask, bool depth, float dval, bool stencil, uint32_t sval,
                   uint32_t smask) {
     if (in_pass && pass_fb_pipe_bits) st.rt_dirty = true;
     ninplace = 0;
     nfeedback = 0;
+    for (int i = 0; i < nlclear; i++) {  // (done by the pass's load operations: begin_pass - each once)
+        if (lclear[i].rec != g_cur_rec) continue;
+        uint32_t asp = lclear[i].aspects;
+        lclear[i].rec = NULL;
+        if (index >= 0 && (asp & 1)) return;
+        if (index < 0) {
+            if (asp & 1) depth = false;
+            if (asp & 2) stencil = false;
+            if (!depth && !stencil) return;
+        }
+    }
+    if (try_defer_clear(index, kind, color, mask, depth, dval, stencil, sval, smask)) return;
     begin_pass();
     for (int i = 0; i < nlclear; i++) {  // (done by the pass's load operations: begin_pass - each once)
         if (lclear[i].rec != g_cur_rec) continue;
@@ -3298,6 +3504,11 @@ typedef struct {
     size_t const_bytes[2];
     ShaderKey vkey, fkey;
     VkShaderModule vs, fs;
+    uint32_t *spv[2];
+    size_t nspv[2];
+    pthread_mutex_t mod_lock;
+    uint64_t mod_used;
+    int mod_refs;
     VkBindingInfo binds[MAX_BIND];
     int nbinds;
 #ifdef __ANDROID__
@@ -3380,14 +3591,19 @@ static void compile_program(void *arg) {
     if (!sv || !sf) { free(sv); free(sf); atomic_store(&p->state, 2); return; }
     p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
     p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
+    pthread_mutex_init(&p->mod_lock, NULL);
     p->vs = vk_module(sv, nv);
     p->fs = vk_module(sf, nf);
-    free(sv);
-    free(sf);
+    p->spv[0] = sv; p->nspv[0] = nv;
+    p->spv[1] = sf; p->nspv[1] = nf;
+    p->mod_used = SDL_GetTicksNS();
     if (!p->vs || !p->fs) {
         if (p->vs) vkDestroyShaderModule(g_vk.dev, p->vs, NULL);
         if (p->fs) vkDestroyShaderModule(g_vk.dev, p->fs, NULL);
         p->vs = p->fs = VK_NULL_HANDLE;
+        free(sv);
+        free(sf);
+        p->spv[0] = p->spv[1] = NULL;
         atomic_store(&p->state, 2);
         return;
     }
@@ -3895,7 +4111,7 @@ static int pipe_keep(void) {
             }
             keep = (total_kb >= 7L * 1024 * 1024) ? 4096 : 1500;
         } else if (g_vk.props.vendorID == 0x13B5 && !vk_low_ram()) {
-            keep = 2400;
+            keep = 1350;
         } else {
             keep = 800;
         }
@@ -3910,19 +4126,39 @@ static void pipe_evict(void) {
     int keep = pipe_keep();
     if (keep <= 0 || now < next) return;
     next = now + 10000000000ull;  // (every 10 s)
+    int mod_gone = 0;
+    if (vk_conserve_ram()) {
+        for (size_t i = 0; i < prog_cache.capacity; i++) {
+            Prog *pr = prog_cache.entries[i].object;
+            if (!pr || atomic_load(&pr->state) != 1 || (!pr->vs && !pr->fs)) continue;
+            pthread_mutex_lock(&pr->mod_lock);
+            if (pr->mod_refs == 0 && pr->mod_used + 15000000000ull <= now && pr->spv[0] && pr->spv[1]) {
+                long long mg0 = vk_mnow();
+                if (pr->vs) { vkDestroyShaderModule(g_vk.dev, pr->vs, NULL); pr->vs = VK_NULL_HANDLE; mod_gone++; }
+                if (pr->fs) { vkDestroyShaderModule(g_vk.dev, pr->fs, NULL); pr->fs = VK_NULL_HANDLE; mod_gone++; }
+                vk_mgrow_add(MG_MODULE, mg0);
+            }
+            pthread_mutex_unlock(&pr->mod_lock);
+        }
+    }
     int live = 0;
     for (size_t i = 0; i < pipe_cache.capacity; i++) {
         Pipe *p = pipe_cache.entries[i].object;
         if (p && !p->evicted && atomic_load(&p->state) == 1) live++;
     }
-    if (live <= keep) return;
+    if (live <= keep) {
+#if defined(__ANDROID__) && defined(M_PURGE)
+        if (mod_gone >= 8 && vk_conserve_ram()) mallopt(M_PURGE, 0);
+#endif
+        return;
+    }
     uint64_t done = vk_completed_seq();
     int target = keep * 4 / 5, gone = 0;
     // oldest first: two passes, shorter windows on low-RAM devices
     const bool short_win = vk_low_ram();
     const uint64_t ages[2] = {
-        short_win ? 90000000000ull : 600000000000ull,
-        short_win ? 30000000000ull : 180000000000ull,
+        short_win ? 90000000000ull : 180000000000ull,
+        short_win ? 30000000000ull : 75000000000ull,
     };
     for (int pass = 0; pass < 2 && live > target; pass++) {
         uint64_t age = ages[pass];
@@ -3941,7 +4177,7 @@ static void pipe_evict(void) {
         }
     }
 #if defined(__ANDROID__) && defined(M_PURGE)
-    if (gone >= 8 && short_win) mallopt(M_PURGE, 0);
+    if ((gone >= 8 || mod_gone >= 8) && vk_conserve_ram()) mallopt(M_PURGE, 0);
 #endif
     static int nlog;
     if (gone && nlog++ < 20) LOG("[vk] pipelines: %d unused ones destroyed, %d kept\n", gone, live);
@@ -3969,9 +4205,24 @@ static VkPrimitiveTopology topo_class_base(uint8_t c) {
 static void build_pipeline(void *arg) {
     Pipe *pp = arg;
     PipeKey *k = &pp->k;
+    Prog *prog = k->prog;
+    pthread_mutex_lock(&prog->mod_lock);
+    if (!prog->vs && prog->spv[0]) prog->vs = vk_module(prog->spv[0], prog->nspv[0]);
+    if (!prog->fs && prog->spv[1]) prog->fs = vk_module(prog->spv[1], prog->nspv[1]);
+    VkShaderModule vs_mod = prog->vs, fs_mod = prog->fs;
+    prog->mod_used = SDL_GetTicksNS();
+    prog->mod_refs++;
+    pthread_mutex_unlock(&prog->mod_lock);
+    if (!vs_mod || !fs_mod) {
+        pthread_mutex_lock(&prog->mod_lock);
+        prog->mod_refs--;
+        pthread_mutex_unlock(&prog->mod_lock);
+        atomic_store(&pp->state, 2);
+        return;
+    }
     VkPipelineShaderStageCreateInfo stages[2] = {
-        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = k->prog->vs, .pName = "main"},
-        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = k->prog->fs, .pName = "main"}};
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs_mod, .pName = "main"},
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs_mod, .pName = "main"}};
     VkVertexInputAttributeDescription va[32];
     VkVertexInputBindingDescription vb[17];
     VkVertexInputBindingDivisorDescriptionEXT vd[17];
@@ -4056,6 +4307,9 @@ static void build_pipeline(void *arg) {
     long long mg0 = vk_mnow();
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, &pp->pipe);
     vk_mgrow_add(MG_GPIPE, mg0);
+    pthread_mutex_lock(&prog->mod_lock);
+    prog->mod_refs--;
+    pthread_mutex_unlock(&prog->mod_lock);
     if (r != VK_SUCCESS) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
@@ -4340,6 +4594,9 @@ static void alias_copy(CopyAlias *a, VkImageAspectFlags aspects, const char *why
     aspects &= d->aspect;
     if (!aspects) return;
     vk_end_pass();
+    vk_flush_tex_clear(s);
+    if ((aspects & d->aspect) != d->aspect) vk_flush_tex_clear(d);
+    else vk_pend_clear_forget(d);
     st.rt_dirty = true;
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
@@ -4376,6 +4633,8 @@ static void alias_before_write(NvnTexture *t, VkImageAspectFlags full, const cha
         CopyAlias *a = &aliases[rename];
         TexBackend *s = a->src->backend, *d = a->dst->backend;
         vk_end_pass();
+        vk_flush_tex_clear(s);
+        vk_pend_clear_forget(d);
         st.rt_dirty = true;
         VkImage im = s->image; s->image = d->image; d->image = im;
         VmaAllocation m = s->mem; s->mem = d->mem; d->mem = m;
@@ -4411,6 +4670,8 @@ static bool alias_make(NvnTexture *src, NvnTexture *dst, TexBackend *s, TexBacke
     alias_before_write(dst, d->aspect, "copy dst");
     src = alias_read(src);  // (a copy of an alias: of its source)
     s = src->backend;
+    vk_flush_tex_clear(s);
+    vk_pend_clear_forget(d);
     if (src == dst) return true;  // (copied back onto itself)
     if (naliases == (int)(sizeof aliases / sizeof aliases[0])) return false;
     aliases[naliases++] = (CopyAlias){src, dst, s->image, d->image};
@@ -4592,6 +4853,7 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
                 fb_copy_prepared = true;
                 if (in_pass && !st.rt_dirty) prof_dirty[1]++;
                 vk_end_pass();
+                vk_flush_all_pending_clears();
                 VkCommandBuffer pcb = vk_cmd();
                 if (vk_narrow_pass_barrier_on() && !g_pass_wrote_non_rt && !naliases) vk_pass_barrier_fragment(pcb);
                 else vk_full_barrier(pcb);
@@ -5775,9 +6037,9 @@ static void gcopy_retire(uint64_t done) {
 // memory once its submission is done (the game reads some of it as uniform buffers, vertices, textures), and to the
 // range's last-uploaded copy, so that isn't taken for the CPU's write.
 typedef struct { uint64_t lo, hi; bool store, learned; } GcRange;  // heap offsets, 256-aligned; learned: gres_learn
-#define GA_SIZE (128ull << 20)  // (the minimum maxStorageBufferRange)
-#define GA_RES (48ull << 20)    // [0, GA_RES): resident slots; the rest: the ring
-#define GA_SEG (8ull << 20)
+#define GA_SIZE (64ull << 20)   // (64 MB arena: saves 64 MB of pinned host-cached RAM on 8 GB Android devices)
+#define GA_RES (24ull << 20)    // [0, GA_RES): resident slots; the rest: the ring
+#define GA_SEG (4ull << 20)
 #define GA_NRES 512
 typedef struct {
     uint64_t lo, hi, off, checked;
@@ -6467,7 +6729,7 @@ static uint64_t vc_budget(void) {
             if (fscanf(f, "MemTotal: %ld kB", &total_kb) != 1) total_kb = 0;
             fclose(f);
         }
-        b = vk_conserve_ram() ? (vk_low_ram() ? 256ull << 20 : 320ull << 20) : 768ull << 20;
+        b = vk_conserve_ram() ? (vk_low_ram() ? 48ull << 20 : 56ull << 20) : 768ull << 20;
         if (vk_low_ram() && total_kb && (uint64_t)total_kb * 1024 / 12 < b)
             b = (uint64_t)total_kb * 1024 / 12;
         if (e && atol(e) > 0) b = (uint64_t)atol(e) << 20;
@@ -6640,7 +6902,8 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
     if (!e->gen || e->used_frame != cur_frame32) {
         e->used_frame = cur_frame32;
         uint32_t idx = (uint32_t)(e - vc_tab);
-        if (!e->gen || e->clean_streak < 8u || ((cur_frame32 + idx) & 7u) == 0u || framepace_in_menu())
+        uint32_t mask = e->clean_streak >= 16u ? 31u : e->clean_streak >= 4u ? 7u : 0u;
+        if (!e->gen || !mask || ((cur_frame32 + idx) & mask) == 0u || framepace_in_menu())
             vc_pend[vc_npend++] = idx;
     }
     prof_vc_hits++;
@@ -6666,7 +6929,13 @@ void vc_flush(void) {
     for (int i = 0; i < vc_npend;) {
         uint64_t lo = vc_tab[vc_pend[i]].lo, hi = vc_tab[vc_pend[i]].hi;
         int j = i + 1;
+#ifdef __ANDROID__
+        // On Android, plat_written_pages arms PROT_READ (mprotect) on every page in [lo, hi). Never bridge non-VBO
+        // heap gaps between separate vertex buffers, or CPU writes to ordinary heap pages in those gaps will fault.
+        for (; j < vc_npend && vc_tab[vc_pend[j]].lo <= hi; j++)
+#else
         for (; j < vc_npend && vc_tab[vc_pend[j]].lo <= hi + 64 * VC_PAGE; j++)
+#endif
             if (vc_tab[vc_pend[j]].hi > hi) hi = vc_tab[vc_pend[j]].hi;
         uint64_t pg = VC_PAGE;
         int n = plat_written_pages(HEAP_BASE + lo, hi - lo, pages, 4096, &pg);
@@ -6762,6 +7031,7 @@ void vk_exec_reset(void) {
     g_inplace_copy = -1;  // (the next boot reads the setting again: resolve_feedback)
     n_pass_fb = 0;
     pass_fb_pipe_bits = 0;
+    n_pend_clear = 0;
     ninplace = 0;
     nfeedback = 0;
 #ifdef __ANDROID__
@@ -7560,6 +7830,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         }
     }
     vk_end_pass();
+    vk_flush_all_pending_clears();
 #ifdef __ANDROID__
     vk_bc_shadows_resolve(NULL, NULL, NULL, 0);  // (BC textures drawn into: decoded before anything outside a pass reads them)
 #endif
@@ -8981,6 +9252,7 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     snap_reason = "buf2tex"; snapshots_invalidate(t);
     alias_before_write(t, 0, "upload");
     vk_end_pass();
+    vk_flush_all_pending_clears();
     const FormatInfo *fi;
     int32_t rg[6];
     int level;
@@ -9036,6 +9308,7 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     if (!t || !dst || dst < HEAP_BASE) return;
     t = alias_read(t);
     vk_end_pass();
+    vk_flush_all_pending_clears();
 #ifdef __ANDROID__
     vk_bc_shadows_resolve(NULL, NULL, NULL, 0);
 #endif
@@ -9121,6 +9394,8 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     if (!st_ || !dt) return;
     snap_reason = "tex2tex"; snapshots_invalidate(dt);
     vk_end_pass();
+    vk_flush_tex_clear((naliases ? alias_read(st_) : st_)->backend);
+    vk_flush_tex_clear(dt->backend);
 #ifdef __ANDROID__
     vk_bc_shadows_resolve(NULL, NULL, NULL, 0);
 #endif
@@ -9532,6 +9807,7 @@ static void scene_upscale(Prog *pr, CmdRec *r) {
         vkGetPhysicalDeviceFormatProperties(g_vk.phys, b->format, &fp);
         if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) continue;
         vk_end_pass();
+        vk_flush_tex_clear(b);
         VkCommandBuffer cb = vk_cmd();
         float iw = (float)b->width, ih = (float)b->height;
         static const VkComponentMapping id = {0};

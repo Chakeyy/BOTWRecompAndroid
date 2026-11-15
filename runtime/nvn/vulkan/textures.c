@@ -566,7 +566,7 @@ static void create_image(NvnTexture *t, TexBackend *b) {
                 min_dim = 128;
             } else if (vk_conserve_ram() && g_vk.props.vendorID == 0x13B5) {
                 half = 1;
-                min_dim = 256;
+                min_dim = 128;
             } else {
                 half = 0;
             }
@@ -580,6 +580,13 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         if (half && compressed && !depthfmt && b->rs_group == RS_NONE && !(t->flags & (8 | 0x50)) && type == VK_IMAGE_TYPE_2D &&
             samples == 1 && levels >= 2 && t->layout.levels >= 2 && tw >= (uint32_t)min_dim && th >= (uint32_t)min_dim) {
             tw >>= 1, th >>= 1, levels--, b->skip = 1;
+#ifdef __ANDROID__
+            if (vk_conserve_ram() && b->bc_vf != VK_FORMAT_UNDEFINED &&
+                vf != VK_FORMAT_ASTC_4x4_UNORM_BLOCK && vf != VK_FORMAT_ASTC_4x4_SRGB_BLOCK &&
+                levels >= 2 && t->layout.levels >= 3 && tw >= 256 && th >= 256) {
+                tw >>= 1, th >>= 1, levels--, b->skip = 2;
+            }
+#endif
         }
     }
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = fixed && twin ? &fl : NULL,
@@ -799,6 +806,7 @@ void backend_texture_destroyed(NvnTexture *t) {
     extern void vk_alias_texture_destroyed(NvnTexture *t);  // (exec.c copy aliases: a source's contents handed over)
     vk_alias_texture_destroyed(t);
     live_remove(b);
+    vk_pend_clear_forget(b);
     destroy_image(b);
     texture_snapshot_forget(b);
     free(b->pending_rgba);
@@ -1249,7 +1257,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     // (low RAM: tex_discard) its guest bytes back to the OS: the whole pages inside it, once its
     // contents are in the image (the copies above took them). Not dynamic, linear, drawn-into or restyled ones.
     if (tex_discard() && tracked && !b->dynamic && !linear && b->rs_group == RS_NONE && !b->gpu_owned && !b->scalable &&
-        b->tp <= 0 && total >= (64u << 10)) {
+        b->tp <= 0 && total >= (16u << 10)) {
         uint64_t lo = (t->addr + 0xFFF) & ~0xFFFull, hi = (t->addr + total) & ~0xFFFull;
         if (hi > lo && !madvise((void *)(uintptr_t)lo, hi - lo, MADV_DONTNEED)) {
             if (!b->discarded) tex_discarded_bytes += hi - lo;

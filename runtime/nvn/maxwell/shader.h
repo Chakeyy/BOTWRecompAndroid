@@ -102,7 +102,7 @@ extern bool maxwell_no_int64;
 // buffer (the arena: exec.c) instead of reading the heap binding, which isn't there
 extern bool maxwell_gmem_miss_log;
 extern unsigned maxwell_gmem_miss_stages;  // (the stages that log: bit = STAGE_*; a store in a shader costs - Adreno)
-#define GMISS_WORD ((128u << 20) / 4u - 1024u)  // (the arena's last 4 KB: count, then up to 64 offsets)
+#define GMISS_WORD ((64u << 20) / 4u - 1024u)  // (the arena's last 4 KB: count, then up to 64 offsets)
 // ... through a binding of their own, writable (GMiss: those 4 KB): the arena (GFast) stays readonly in a shader that
 // only reads - writable, Adreno's fast read path was gone (the lit pass ~4x slower per pixel)
 #define GMISS_BUFFER_INDEX 22
