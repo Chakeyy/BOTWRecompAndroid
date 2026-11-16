@@ -531,6 +531,9 @@ extern "C" void renderer_get_scene_scale(float *sx, float *sy);  // (vulkan/text
 extern "C" void renderer_get_scale(float *sx, float *sy);        // (the final image's)
 extern "C" int input_pad_family(void);  // runtime/hle/input.c
 extern "C" double output_scale_dynamic_factor(void);
+extern "C" bool vk_low_ram_auto(void);
+extern "C" void launcher_restart_app(void);
+extern "C" int vk_recent_fs_shaders(uint64_t *hashes, uint32_t *hits, uint16_t *w, uint16_t *h, uint8_t *nc, uint8_t *dp, int max);
 
 static void tab_display(void) {
     float scale = ImGui::GetFontSize() / 34;
@@ -752,6 +755,212 @@ static void tab_display(void) {
                "Translates the game's shaders with 32-bit address math, the path used for drivers without 64-bit "
                "integers (Adreno 6xx / 7xx and Mali stock drivers). Try it if lighting, grass or text are missing or wrong "
                "on your GPU. Applies to shaders translated from now on: restart the app for all of them.");
+    opt_toggle("Frame profiler", &g_settings.vk_prof, true,
+               "Writes per-stage CPU and GPU frame timings ([vkprof]) every 2 seconds to the log file, so you can see "
+               "whether the GPU or CPU is holding the frame rate back. Restart the game to apply.");
+    opt_section("Performance");
+    opt_toggle("Shadows", &g_settings.skip_shadows, true,
+               "Skips the sun and point-light shadow passes and shadow-map lookups (~600 draws per frame in the "
+               "overworld). Everything stays lit without cast shadows. Applies at once (toggle before loading for "
+               "samplers).", false, "Off", "On");
+    opt_toggle("Grass", &g_settings.skip_grass, false,
+               "Skips instanced grass blade draws in the overworld. A big GPU and CPU win in fields and woods. "
+               "Applies at once.", false, "Off", "On");
+    {
+        static const char *p_opts[] = {"Normal", "Reduced", "Off"};
+        int pi = g_settings.particles;
+        if (pi < 0 || pi > 2) pi = 0;
+        if (opt_choice("Particles", &pi, p_opts, 3, 1,
+                       "Particle effects (sparks, dust clouds, smoke, splashes). Reduced: skips heavy and multi-instance "
+                       "particle bursts. Off: skips all blended particle billboards. Applies at once.", false))
+            g_settings.particles = pi;
+    }
+    opt_toggle("Environmental effects", &g_settings.no_ambient, true,
+               "Turns off ambient weather, volumetric fog sheets, god-rays, and heat-haze overlays in the world. "
+               "Applies at once.", false, "Off", "On");
+    opt_toggle("Skip extra effect shaders", &g_settings.skip_named, false,
+               "Skips secondary effect shaders (lens flares, cloud shadow projections, wet specular overlays). "
+               "Applies at once.");
+    {
+        static const char *gd_opts[] = {"Normal", "Reduced (50%)", "Low (25%)"};
+        int gi = g_settings.geo_detail;
+        if (gi < 0 || gi > 2) gi = 0;
+        if (opt_choice("Geometry detail (clutter)", &gi, gd_opts, 3, 1,
+                       "Thins instanced world detail (foliage, rocks, ground clutter) drawn in batches. Reduced draws "
+                       "half the instances per batch; Low draws a quarter. Applies at once.", false))
+            g_settings.geo_detail = gi;
+    }
+    {
+        static const char *rd_opts[] = {"Normal (100%)", "Far (75%)", "Medium (50%)", "Near (30%)"};
+        int rdi = g_settings.render_dist;
+        if (rdi < 0 || rdi > 3) rdi = 0;
+        if (opt_choice("Render distance", &rdi, rd_opts, 4, 0,
+                       "Pulls the main camera's far clip plane closer so distant mountains, trees, and objects are "
+                       "culled by the game's frustum. Applies at once.", false))
+            g_settings.render_dist = rdi;
+    }
+    {
+        static const char *tq_opts[] = {"Auto", "Low (half size)", "Normal (full)"};
+        int tqi = g_settings.tex_quality;
+        if (tqi < 0 || tqi > 2) tqi = 0;
+        if (opt_choice("Texture quality", &tqi, tq_opts, 3, 1,
+                       "Low loads mipmapped world textures from their second mip level (1/4 the GPU memory and "
+                       "memory bandwidth). Auto uses Low when RAM saving is on. Takes effect for newly loaded textures "
+                       "(restart the app for all).", false))
+            g_settings.tex_quality = tqi;
+    }
+    {
+        static const char *tc_opts[] = {"No cap", "1024 px", "512 px", "256 px"};
+        static const int tc_vals[] = {0, 1024, 512, 256};
+        int tci = 0;
+        for (int i = 0; i < 4; i++) if (tc_vals[i] == g_settings.tex_cap) tci = i;
+        if (opt_choice("Max texture resolution", &tci, tc_opts, 4, 0,
+                       "Caps the largest dimension of mipmapped compressed textures by skipping their top mip levels. "
+                       "512 px or 256 px drastically cuts VRAM usage and texture bandwidth. Restart the app for all.", false))
+            g_settings.tex_cap = tc_vals[tci];
+    }
+    {
+        static const char *af_opts[] = {"Game's (up to 16x)", "Off (1x)", "2x", "4x", "8x"};
+        static const int af_vals[] = {0, 1, 2, 4, 8};
+        int afi = 0;
+        for (int i = 0; i < 5; i++) if (af_vals[i] == g_settings.aniso_cap) afi = i;
+        if (opt_choice("Anisotropic filtering", &afi, af_opts, 5, 1,
+                       "Caps anisotropic texture filtering on oblique ground and walls. Off (1x) or 2x saves texture "
+                       "unit bandwidth on mobile GPUs. Restart the app to apply to all samplers.", false))
+            g_settings.aniso_cap = af_vals[afi];
+    }
+    {
+        extern bool vk_low_ram_auto(void);
+        extern void launcher_restart_app(void);
+        bool auto_on = vk_low_ram_auto();
+        static const char *ram_auto_on[] = {"Automatic (on)", "Off", "On"};
+        static const char *ram_auto_off[] = {"Automatic (off)", "Off", "On"};
+        int ri = g_settings.low_ram < 0 ? 0 : g_settings.low_ram ? 2 : 1;
+        if (opt_choice("RAM saving", &ri, auto_on ? ram_auto_on : ram_auto_off, 3, 2,
+                       "Uses less RAM and GPU memory: half-size mipmapped textures, smaller vertex cache, and 720p "
+                       "Auto output resolution. Turn it On if the game runs out of memory or stutters on 4-8 GB phones. "
+                       "Takes effect when the app restarts.", false)) {
+            g_settings.low_ram = ri == 0 ? -1 : ri == 2 ? 1 : 0;
+            settings_save();
+        }
+        if (opt_action("Apply & restart app", "", "Saves settings and restarts the app now so RAM saving and texture "
+                                                  "settings take effect.", false))
+            launcher_restart_app();
+    }
+    opt_section("Frame rate tools");
+    {
+        static const char *fl_opts[] = {"Off (use Frame rate)", "15 fps", "20 fps", "25 fps", "30 fps", "40 fps", "45 fps", "60 fps"};
+        static const int fl_vals[] = {0, 15, 20, 25, 30, 40, 45, 60};
+        int fli = 0;
+        for (int i = 0; i < 8; i++) if (fl_vals[i] == g_settings.fps_limit) fli = i;
+        if (opt_choice("FPS limiter", &fli, fl_opts, 8, 0,
+                       "Overrides the target frame rate with a custom cap (e.g. 25 fps for phones that can't quite hold "
+                       "30 fps, keeping the game clock smooth via VFR). Applies at once.", false))
+            g_settings.fps_limit = fl_vals[fli];
+    }
+    {
+        static const char *pm_opts[] = {"Smooth (steered)", "Strict grid", "Unpaced (no sleep)"};
+        int pmi = g_settings.pace_mode;
+        if (pmi < 0 || pmi > 2) pmi = 0;
+        if (opt_choice("Frame pacing mode", &pmi, pm_opts, 3, 0,
+                       "Smooth: steers presents to half a vsync. Strict grid: steady timer without vsync phase steering. "
+                       "Unpaced: never sleeps before presenting (lowest latency when GPU-bound). Applies at once.", false))
+            g_settings.pace_mode = pmi;
+    }
+    opt_toggle("Frame pacer (smooth clock)", &g_settings.framepace_off, false,
+               "When On, the runtime paces frames smoothly and adjusts the game's clock to the real frame time. Turn Off "
+               "to use the game's native Switch 30/20 fps vsync stepper instead. Applies at once.", false, "Off", "On");
+    {
+        static const char *dm_opts[] = {"50% (default)", "60%", "75%", "35% (low)", "25% (ultra low)"};
+        static const int dm_vals[] = {50, 60, 75, 35, 25};
+        int dmi = 0;
+        for (int i = 0; i < 5; i++) if (dm_vals[i] == g_settings.dyn_min) dmi = i;
+        if (opt_choice("Dynamic resolution floor", &dmi, dm_opts, 5, 0,
+                       "How low Internal resolution -> Dynamic is allowed to drop when the GPU is busy. 35% or 25% "
+                       "keeps the frame rate up in heavy scenes at the cost of a softer picture.", false))
+            g_settings.dyn_min = dm_vals[dmi];
+    }
+    {
+        static const char *dt_opts[] = {"Auto (follows Frame rate)", "30 fps (33 ms)", "45 fps (22 ms)", "60 fps (16.7 ms)"};
+        static const int dt_vals[] = {0, 30, 45, 60};
+        int dti = 0;
+        for (int i = 0; i < 4; i++) if (dt_vals[i] == g_settings.dyn_target) dti = i;
+        if (opt_choice("Dynamic resolution target", &dti, dt_opts, 4, 1,
+                       "The frame rate that Internal resolution -> Dynamic tries to maintain.", false))
+            g_settings.dyn_target = dt_vals[dti];
+    }
+    opt_section("Performance experiments");
+    opt_toggle("Aggressive vertex cache", &g_settings.vc_aggressive, true,
+               "Checks cached static vertex buffers for CPU writes 4x less often (every 128 frames instead of 32), "
+               "reducing CPU overhead on scenes with many draws. Applies at once.");
+    {
+        static const char *vc_opts[] = {"Auto", "128 MB", "256 MB", "384 MB", "512 MB", "768 MB"};
+        static const int vc_vals[] = {0, 128, 256, 384, 512, 768};
+        int vci = 0;
+        for (int i = 0; i < 6; i++) if (vc_vals[i] == g_settings.vc_budget_mb) vci = i;
+        if (opt_choice("Vertex cache budget", &vci, vc_opts, 6, 0,
+                       "GPU memory reserved for caching vertex buffers. Lower saves RAM on 4-6 GB phones; higher reduces "
+                       "re-uploads in busy areas. Restart the app to apply.", false))
+            g_settings.vc_budget_mb = vc_vals[vci];
+    }
+    {
+        static const char *sw_opts[] = {"Auto", "1 thread", "2 threads", "3 threads", "4 threads"};
+        int swi = g_settings.shader_workers;
+        if (swi < 0 || swi > 4) swi = 0;
+        if (opt_choice("Shader compile threads", &swi, sw_opts, 5, 2,
+                       "Background CPU threads compiling new shaders and pipelines. Fewer threads (1-2) leaves more CPU "
+                       "for the game while exploring; more threads (3-4) compiles new effects faster. Restart to apply.", false))
+            g_settings.shader_workers = swi;
+    }
+    {
+        static const char *cp_opts[] = {"Low (less stutter)", "Normal", "High (faster compile)"};
+        int cpi = g_settings.compile_prio < 0 ? 0 : g_settings.compile_prio > 0 ? 2 : 1;
+        if (opt_choice("Shader compile priority", &cpi, cp_opts, 3, 0,
+                       "CPU scheduling priority of background shader compilation. Low keeps shader builds from stealing "
+                       "CPU time from the game thread. Applies at once.", false))
+            g_settings.compile_prio = cpi == 0 ? -1 : cpi == 2 ? 1 : 0;
+    }
+    {
+        extern int vk_recent_fs_shaders(uint64_t *hashes, uint32_t *hits, uint16_t *w, uint16_t *h, uint8_t *nc, uint8_t *dp, int max);
+        uint64_t hashes[24]; uint32_t hits[24]; uint16_t sw[24], sh[24]; uint8_t nc[24], dp[24];
+        int n = vk_recent_fs_shaders(hashes, hits, sw, sh, nc, dp, 24);
+        if (g_settings.skip_fs[0] && opt_action("Clear skipped shaders", g_settings.skip_fs,
+                                                "Restores all fragment shaders skipped below.", false)) {
+            g_settings.skip_fs[0] = 0;
+            settings_save();
+        }
+        for (int i = 0; i < n; i++) {
+            char hex[20], label[64], desc[192];
+            snprintf(hex, sizeof hex, "%016llx", (unsigned long long)hashes[i]);
+            bool skipped = strstr(g_settings.skip_fs, hex) != NULL;
+            snprintf(label, sizeof label, "Shader %016llx", (unsigned long long)hashes[i]);
+            snprintf(desc, sizeof desc, "Target %ux%u (%u color%s) - %u draws recently. Toggle off to skip its draws live.",
+                     sw[i], sh[i], nc[i], dp[i] ? " + depth" : "", hits[i]);
+            if (opt_toggle(label, &skipped, false, desc, false, "Off", "On")) {
+                if (skipped) {
+                    size_t l = strlen(g_settings.skip_fs);
+                    if (l + 18 < sizeof g_settings.skip_fs)
+                        snprintf(g_settings.skip_fs + l, sizeof g_settings.skip_fs - l, "%s%s", l ? "," : "", hex);
+                } else {
+                    char out[256] = "";
+                    for (const char *p = g_settings.skip_fs; *p;) {
+                        while (*p == ',' || *p == ' ') p++;
+                        if (!*p) break;
+                        const char * c = strchr(p, ',');
+                        size_t len = c ? (size_t)(c - p) : strlen(p);
+                        if (len != 16 || strncmp(p, hex, 16) != 0) {
+                            size_t ol = strlen(out);
+                            if (ol + len + 2 < sizeof out)
+                                snprintf(out + ol, sizeof out - ol, "%s%.*s", ol ? "," : "", (int)len, p);
+                        }
+                        p += len;
+                    }
+                    snprintf(g_settings.skip_fs, sizeof g_settings.skip_fs, "%s", out);
+                }
+                settings_save();
+            }
+        }
+    }
 #endif
     opt_end();
 }

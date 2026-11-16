@@ -73,8 +73,23 @@ uint32_t rt_aspect_bits(int site) {
 static volatile bool g_widened;  // (rt_persp_update has widened a camera)
 static bool is_16_9(float a) { return a > 1.7767f && a < 1.7789f; }
 RT_ON_RESET(widescreen_reset) { g_boot_aspect = -1, g_hooked = false, g_widened = false; }  // (Return to start: a new boot)
+#ifdef __ANDROID__
+static void persp_far_limit(uint64_t proj) {
+    if (!proj || !g_settings.render_dist) return;
+    float *far_p = (float *)(uintptr_t)(proj + 0x9c);
+    float f = *far_p;
+    if (f >= 500.0f && f <= 60000.0f) {
+        static const float scale[] = {1.0f, 0.75f, 0.50f, 0.30f};
+        int m = g_settings.render_dist;
+        if (m >= 1 && m <= 3) *far_p = f * scale[m];
+    }
+}
+#endif
 void rt_persp_update(uint64_t proj) {
     g_hooked = true;
+#ifdef __ANDROID__
+    persp_far_limit(proj);
+#endif
     if (!proj || !widescreen_allowed() || g_shape <= 1.001f) return;
     float *aspect = (float *)(uintptr_t)(proj + 0xB0);
     if (ENV("LARECOMP_LOG_ASPECT")) {  // (each projection rebuilt, once: near, far, fovy, aspect)

@@ -57,6 +57,9 @@ static int env_int(const char *name, int def) {
 }
 
 bool framepace_on(void) {
+#ifdef __ANDROID__
+    if (g_settings.framepace_off) return false;
+#endif
     static int on = -1;
     if (on < 0) on = g_game_version >= 182 && env_int("LARECOMP_FRAMEPACE", 1) != 0;
     return on;
@@ -108,7 +111,8 @@ int framepace_target(void) {
     // (Video > Frame rate: 20, 30, 40 / 45, 60; Auto is 60 here - the clock follows whatever the frames really take.
     // 40 / 45: whichever the screen shows evenly, vulkan/device.c vk_between_fps - the game in its 60 fps way)
     extern int vk_between_fps(void);
-    int fps = forced >= 0 ? forced : g_settings.fps_mode == 1 ? 30 : g_settings.fps_mode == 3 ? 20
+    int fps = forced >= 0 ? forced : g_settings.fps_limit > 0 ? g_settings.fps_limit
+            : g_settings.fps_mode == 1 ? 30 : g_settings.fps_mode == 3 ? 20
             : g_settings.fps_mode == 4 ? vk_between_fps() : 60;
     if (movie > 0 && __atomic_load_n(&g_movie_playing, __ATOMIC_RELAXED) > 0 && (fps == 0 || fps > movie)) fps = movie;
     if (menu > 0 && (fps == 0 || fps > menu) && in_menu()) fps = menu;
@@ -241,14 +245,16 @@ void rt_vfr_update(uint64_t vfr) {
         // above never let it go, and a hitch (a save, a menu, a load) left the game at 20 fps (or 30) for good (#339
         // #374). Not in the 20 fps mode. LARECOMP_NO_INTERVAL_ESCAPE=1: as before.
         extern double vk_frame_work_ms(void);
-        static int fits;
+        static int fits, probe;
         static int off = -1;
         if (off < 0) off = env_int("LARECOMP_NO_INTERVAL_ESCAPE", 0);
         double w = off ? -1 : vk_frame_work_ms();
         bool can = (iv == 3 && g_settings.fps_mode != 3 && w > 0 && w < 26.0) ||
                    (iv == 2 && g_settings.fps_mode == 2 && w > 0 && w < 13.0);
         fits = can ? fits + 1 : 0;
-        if (fits > 60) iv--, slow = iv == 1 ? 0.5f : 1.0f, fits = 0;
+        if (!off && iv == 3 && g_settings.fps_mode != 3) probe++;
+        else probe = 0;
+        if (fits > 60 || probe >= 80) iv--, slow = iv == 1 ? 0.5f : 1.0f, fits = 0, probe = 0;
     }
     VF(float, vfr, VFR_RATIO) = ratio;
     VF(float, vfr, VFR_NEW_RATIO) = ratio;

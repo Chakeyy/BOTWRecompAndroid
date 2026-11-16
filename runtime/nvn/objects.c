@@ -323,13 +323,18 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     // (2026-10-28, POCO F7 Ultra; issue #43 on an Adreno 740) - the water's colour taken once, while loading, from a GPU
     // result the lag made a frame old. So each load (the save, a fast travel) runs its first seconds without it.
     if (lag > 0 && env_lag < 0) {
-        enum { LAG_SETTLE = 300 };
+        enum { LAG_SETTLE = 300, LAG_LEAVE = 45 };
         extern uint64_t vk_scene_frame(void), renderer_present_count(void);
-        static uint64_t world_since;
+        static uint64_t world_since, world_left;
         uint64_t now = renderer_present_count(), seen = vk_scene_frame();
         bool world = !framepace_on_title() && seen && (now - seen < 20 || framepace_in_menu());
-        if (!world) world_since = 0;
-        else if (!world_since) world_since = now;
+        if (world) {
+            world_left = 0;
+            if (!world_since) world_since = now;
+        } else if (world_since) {
+            if (!world_left) world_left = now;
+            if (framepace_on_title() || now - world_left >= LAG_LEAVE) world_since = world_left = 0;
+        }
         if (!world_since || now - world_since < LAG_SETTLE) lag = 0;
     }
     extern int vk_ab(const char *what);
@@ -1553,9 +1558,20 @@ NVN(nvnQueuePresentTexture) {
         if (on < 0) on = !getenv("LARECOMP_PRESENT_WAIT") || atoi(getenv("LARECOMP_PRESENT_WAIT"));
         extern volatile uint64_t g_vsync_count;
         extern __thread uint64_t g_blocked_ns;  // (kernel.c: the pacer counts this as idle, not frame work)
+#ifdef __ANDROID__
+        int pmode = g_settings.pace_mode;
+#else
+        int pmode = 0;
+#endif
         int cap = g_settings.fps_mode == 2 || g_settings.fps_mode == 4 ? 1 : g_settings.fps_mode == 3 ? 3 : 2;  // (20: 3; 45: 60's)
+#ifdef __ANDROID__
+        if (g_settings.fps_limit > 0)
+            cap = g_settings.fps_limit >= 45 ? 1 : g_settings.fps_limit >= 25 ? 2 : 3;
+#endif
         int n = w->interval > cap ? w->interval : cap;
-        if (on && framepace_on()) {
+        if (on && pmode == 2 && framepace_on()) {
+            framepace_presented(plat_now_ns(), false);
+        } else if (on && pmode != 2 && framepace_on()) {
             // BOTW 1.8.2 (runtime/hle/framepace.c): a steady grid at the chosen frame rate, whatever the interval;
             // after a long frame the grid starts again. framepace.c sets the game's clock from when it went out.
             static uint64_t last;
@@ -1576,7 +1592,7 @@ NVN(nvnQueuePresentTexture) {
             // reached from ~1.5 ms before a vsync to ~2.5 ms after one, so the phase is held close to the half.
             int64_t off;
             uint64_t vp;
-            if (backend_vsync_offset(last + period, period, &off, &vp)) {
+            if (pmode == 0 && backend_vsync_offset(last + period, period, &off, &vp)) {
                 if (!steer && !stuck && (off > 500000 || off < -500000)) steer = off > 0 ? 1 : -1, steered = 0;
                 if (!on_grid) {
                     static int logged;
@@ -1597,7 +1613,7 @@ NVN(nvnQueuePresentTexture) {
                     }
                 }
             }
-        } else if (on) {
+        } else if (on && pmode != 2) {
             uint64_t want = last_vs + (uint64_t)n, t0 = plat_now_ns();
             while (__atomic_load_n(&g_vsync_count, __ATOMIC_RELAXED) < want) usleep(500);
             g_blocked_ns += plat_now_ns() - t0;

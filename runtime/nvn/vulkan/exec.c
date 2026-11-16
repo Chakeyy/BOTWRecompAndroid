@@ -144,6 +144,8 @@ static bool seq_thread_broken;
 static pthread_mutex_t sw_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t sw_cv = PTHREAD_COND_INITIALIZER;
 static _Atomic uint64_t sw_submitted;
+#define SEQ_FENCES 64
+static VkFence seq_fences[SEQ_FENCES];
 static void *seq_waiter(void *arg) {
     (void)arg;
 #ifdef __ANDROID__
@@ -156,12 +158,17 @@ static void *seq_waiter(void *arg) {
         while ((done = atomic_load(&done_cached)) >= atomic_load(&sw_submitted)) pthread_cond_wait(&sw_cv, &sw_m);
         pthread_mutex_unlock(&sw_m);
         uint64_t want = done + 1;
-        VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
-                                  .pValues = &want};
-        VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 1000000000ull);
-        if (r == VK_SUCCESS) done_note(want);
-        else if (r != VK_TIMEOUT) {  // (device lost: the callers' own waits report it)
+        VkResult r = vkWaitForFences(g_vk.dev, 1, &seq_fences[want % SEQ_FENCES], VK_TRUE, 1000000000ull);
+        if (r == VK_SUCCESS) {
+            done_note(want);
+            pthread_mutex_lock(&sw_m);
+            pthread_cond_broadcast(&sw_cv);
+            pthread_mutex_unlock(&sw_m);
+        } else if (r != VK_TIMEOUT) {  // (device lost: the callers' own waits report it)
             seq_thread_broken = true;
+            pthread_mutex_lock(&sw_m);
+            pthread_cond_broadcast(&sw_cv);
+            pthread_mutex_unlock(&sw_m);
             return NULL;
         }
     }
@@ -176,19 +183,35 @@ static bool seq_thread_on(void) {
         seq_thread = e ? atoi(e) != 0 : vk_low_ram();
 #endif
         if (seq_thread) {
+            VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .flags = VK_FENCE_CREATE_SIGNALED_BIT};
+            for (int i = 0; i < SEQ_FENCES; i++)
+                if (vkCreateFence(g_vk.dev, &fi, NULL, &seq_fences[i]) != VK_SUCCESS) seq_thread = 0;
             pthread_t th;
-            if (pthread_create(&th, NULL, seq_waiter, NULL)) seq_thread = 0;
-            else pthread_detach(th);
-            LOG("[vk] GPU progress: %s\n", seq_thread ? "a thread of its own waits on it" : "asked of the driver");
+            if (seq_thread && pthread_create(&th, NULL, seq_waiter, NULL)) seq_thread = 0;
+            else if (seq_thread) pthread_detach(th);
+            LOG("[vk] GPU progress: %s\n", seq_thread ? "a fence per submission" : "the timeline semaphore");
         }
     }
     return seq_thread && !seq_thread_broken;
+}
+static VkFence seq_fence_for(uint64_t s) {
+    if (!seq_thread_on()) return VK_NULL_HANDLE;
+    uint64_t done = atomic_load(&done_cached);
+    if (s >= done + SEQ_FENCES) {
+        uint64_t need = s - SEQ_FENCES + 1;
+        pthread_mutex_lock(&sw_m);
+        while (atomic_load(&done_cached) < need && !seq_thread_broken) pthread_cond_wait(&sw_cv, &sw_m);
+        pthread_mutex_unlock(&sw_m);
+    }
+    VkFence f = seq_fences[s % SEQ_FENCES];
+    vkResetFences(g_vk.dev, 1, &f);
+    return f;
 }
 static void seq_submitted(uint64_t s) {
     if (!seq_thread_on()) return;
     pthread_mutex_lock(&sw_m);
     atomic_store(&sw_submitted, s);
-    pthread_cond_signal(&sw_cv);
+    pthread_cond_broadcast(&sw_cv);
     pthread_mutex_unlock(&sw_m);
 }
 
@@ -251,8 +274,19 @@ void vk_wait_seq(uint64_t seq) {
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
                               .pValues = &seq};
     uint64_t t0 = SDL_GetTicksNS();
-    VkResult r = seq_thread_on() && atomic_load(&done_cached) >= seq ? VK_SUCCESS  // (finished already: no driver call)
-                 : vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
+    VkResult r = VK_SUCCESS;
+    if (seq_thread_on()) {
+        if (atomic_load(&done_cached) < seq) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 10;
+            pthread_mutex_lock(&sw_m);
+            while (atomic_load(&done_cached) < seq && !seq_thread_broken)
+                if (pthread_cond_timedwait(&sw_cv, &sw_m, &ts) != 0) break;
+            pthread_mutex_unlock(&sw_m);
+            r = atomic_load(&done_cached) >= seq ? VK_SUCCESS : seq_thread_broken ? VK_ERROR_DEVICE_LOST : VK_TIMEOUT;
+        }
+    } else r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
     stat_wait_ns += SDL_GetTicksNS() - t0;
     cum_wait += SDL_GetTicksNS() - t0;
     wait_account(SDL_GetTicksNS() - t0);
@@ -1062,14 +1096,17 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     if (s->ts) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 2 + 1);
     VK_CHECK(vkEndCommandBuffer(s->main));
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
-    VkSemaphoreSubmitInfo sig[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
-                                     .value = submit_seq + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
-                                    {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = signal,
-                                     .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT}};
+    VkFence sfence = seq_fence_for(submit_seq + 1);
+    VkSemaphoreSubmitInfo sig[2];
+    uint32_t nsig = 0;
+    if (!sfence) sig[nsig++] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
+                                                       .value = submit_seq + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    if (signal) sig[nsig++] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = signal,
+                                                      .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkSemaphoreSubmitInfo wt = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = wait,
                                 .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = (uint32_t)n, .pCommandBufferInfos = cbs,
-                        .signalSemaphoreInfoCount = signal ? 2 : 1, .pSignalSemaphoreInfos = sig,
+                        .signalSemaphoreInfoCount = nsig, .pSignalSemaphoreInfos = sig,
                         .waitSemaphoreInfoCount = wait ? 1 : 0, .pWaitSemaphoreInfos = &wt};
     {
         PROF_T0();
@@ -1077,7 +1114,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
 #ifdef __ANDROID__
         uint64_t trace_start = vk_timing_trace_on() ? SDL_GetTicksNS() : 0;
 #endif
-        VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, VK_NULL_HANDLE);
+        VkResult sr = vkQueueSubmit2(g_vk.queue, 1, &si, sfence);
 #ifdef __ANDROID__
         tl_add((int64_t)plat_now_ns(), wait || signal ? "render: submitted (present)" : "render: submitted", submit_seq + 1, 0);
         if (trace_start) vk_timing_trace_wait(VK_TIMING_SUBMIT, SDL_GetTicksNS() - trace_start);
@@ -1301,18 +1338,25 @@ static void desc_bank_reset_all(void) {
 // On devices sold with up to 4 GB of RAM (reported MemTotal below 4 GiB), 16 MB chunks and 2 kept - the 64 MB ones, 4
 // kept, were a quarter of the GPU memory the Android killed the game over, as the world loaded (Galaxy Tab A9+,
 // 2026-11-08). Leave 6 GB devices on the normal path. LARECOMP_LOW_RAM=1 / 0 overrides detection.
+bool vk_low_ram_auto(void) {
+    long total_kb = 0;
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (f) {
+        if (fscanf(f, "MemTotal: %ld kB", &total_kb) != 1) total_kb = 0;
+        fclose(f);
+    }
+    return total_kb && total_kb < 4L * 1024 * 1024;
+}
 bool vk_low_ram(void) {
     static int low = -1;
     if (low < 0) {
         const char *e = getenv("LARECOMP_LOW_RAM");
-        long total_kb = 0;
-        FILE *f = fopen("/proc/meminfo", "r");
-        if (f) {
-            if (fscanf(f, "MemTotal: %ld kB", &total_kb) != 1) total_kb = 0;
-            fclose(f);
-        }
-        low = e ? atoi(e) != 0 : total_kb && total_kb < 4L * 1024 * 1024;
-        if (low) LOG("[vk] low on RAM (%ld MB): smaller buffers\n", total_kb >> 10);
+        int set = -1;
+#ifdef __ANDROID__
+        set = g_settings.low_ram;
+#endif
+        low = e ? atoi(e) != 0 : set >= 0 ? set != 0 : vk_low_ram_auto();
+        if (low) LOG("[vk] low-RAM mode on (%s)\n", e ? "env" : set >= 0 ? "setting" : "< 4 GB");
     }
     return low;
 }
@@ -1781,6 +1825,7 @@ static void run_job(void (*fn)(void *), void *arg) {
         n = cores / 2;
         int max_w = vk_low_ram() ? 2 : (cores >= 8 ? 4 : 3);
         if (n > max_w) n = max_w;
+        if (g_settings.shader_workers > 0) n = g_settings.shader_workers;
 #endif
         const char *workers = getenv("LARECOMP_SHADER_WORKERS");
         if (workers) n = atoi(workers);
@@ -2729,7 +2774,7 @@ void vk_flush_all_pending_clears(void) {
 }
 
 bool vk_sync_lag_allowed(void) {
-    return g_vk.props.vendorID != 0x13B5 && !gcopy_mode;
+    return true;
 }
 
 static void sync_rt_scale(void) {
@@ -3589,7 +3634,18 @@ static void subst_glsl(ShaderInfo *si, uint64_t addr, const char *suffix) {
 }
 #endif
 
+static void compile_thread_prio(void) {
+#ifdef __ANDROID__
+    static __thread int applied = -99;
+    int want = g_settings.compile_prio;
+    if (want != applied) {
+        applied = want;
+        nice(want < 0 ? 10 : want > 0 ? -2 : 0);
+    }
+#endif
+}
 static void compile_program(void *arg) {
+    compile_thread_prio();
     Prog *p = arg;
     size_t nv = 0, nf = 0;
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
@@ -4212,6 +4268,7 @@ static VkPrimitiveTopology topo_class_base(uint8_t c) {
 }
 
 static void build_pipeline(void *arg) {
+    compile_thread_prio();
     Pipe *pp = arg;
     PipeKey *k = &pp->k;
     Prog *prog = k->prog;
@@ -6752,6 +6809,9 @@ static uint64_t vc_budget(void) {
         b = vk_conserve_ram() ? (vk_low_ram() ? 48ull << 20 : 56ull << 20) : 768ull << 20;
         if (vk_low_ram() && total_kb && (uint64_t)total_kb * 1024 / 12 < b)
             b = (uint64_t)total_kb * 1024 / 12;
+#ifdef __ANDROID__
+        if (g_settings.vc_budget_mb >= 64) b = (uint64_t)g_settings.vc_budget_mb << 20;
+#endif
         if (e && atol(e) > 0) b = (uint64_t)atol(e) << 20;
         LOG("[vk] buffer cache: up to %llu MB on the GPU\n", (unsigned long long)(b >> 20));
     }
@@ -6931,7 +6991,13 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
     if (!e->gen || e->used_frame != cur_frame32) {
         e->used_frame = cur_frame32;
         uint32_t idx = (uint32_t)(e - vc_tab);
+#ifdef __ANDROID__
+        uint32_t m_hi = g_settings.vc_aggressive ? 127u : 31u;
+        uint32_t m_lo = g_settings.vc_aggressive ? 31u : 7u;
+        uint32_t mask = e->gpu ? 0u : e->clean_streak >= 16u ? m_hi : e->clean_streak >= 4u ? m_lo : 0u;
+#else
         uint32_t mask = e->gpu ? 0u : e->clean_streak >= 16u ? 31u : e->clean_streak >= 4u ? 7u : 0u;
+#endif
         if (!e->gen || !mask || ((cur_frame32 + idx) & mask) == 0u || framepace_in_menu())
             vc_pend[vc_npend++] = idx;
     }
@@ -7717,6 +7783,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
 typedef struct { Prog p; ShaderInfo *si; VkPipeline pipe; uint32_t local[3]; uint64_t code_addr; } CsProg;
 
 static void build_compute(void *arg) {
+    compile_thread_prio();
     CsProg *cp = arg;
     size_t n = 0;
     uint32_t *spv = vk_glsl_to_spirv(cp->si->msl, STAGE_COMPUTE, "cs", &n);
@@ -8036,6 +8103,114 @@ void vk_pick_report(void) {
     pick.draws = 0;
 }
 
+#ifdef __ANDROID__
+#include "shader_groups.h"
+// Recent fragment shaders seen in the last few seconds, for the in-game menu's live shader skipper (ui/menu.mm).
+#define FS_HIST_N 48
+typedef struct { uint64_t hash; uint32_t hits; uint64_t frame; uint16_t w, h; uint8_t ncolor, depth; } FsHist;
+static FsHist g_fs_hist[FS_HIST_N];
+static void fs_hist_note(uint64_t h) {
+    if (!h) return;
+    uint64_t f = renderer_present_count();
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < FS_HIST_N; i++) {
+        if (g_fs_hist[i].hash == h) { slot = i; break; }
+        if (f - g_fs_hist[i].frame > 180) g_fs_hist[i].hits = 0;
+        if (g_fs_hist[i].hits < g_fs_hist[oldest].hits) oldest = i;
+    }
+    if (slot < 0) { slot = oldest; g_fs_hist[slot] = (FsHist){.hash = h}; }
+    if (g_fs_hist[slot].frame != f) g_fs_hist[slot].frame = f;
+    g_fs_hist[slot].hits++;
+    NvnTexture *t = st.rt.ncolor ? st.rt.color[0] : st.rt.depth;
+    g_fs_hist[slot].w = t ? (uint16_t)t->width : 0;
+    g_fs_hist[slot].h = t ? (uint16_t)t->height : 0;
+    g_fs_hist[slot].ncolor = (uint8_t)st.rt.ncolor;
+    g_fs_hist[slot].depth = st.rt.depth != NULL;
+}
+int vk_recent_fs_shaders(uint64_t *hashes, uint32_t *hits, uint16_t *w, uint16_t *h, uint8_t *nc, uint8_t *dp, int max) {
+    uint64_t f = renderer_present_count();
+    int idx[FS_HIST_N], n = 0;
+    for (int i = 0; i < FS_HIST_N; i++)
+        if (g_fs_hist[i].hash && f - g_fs_hist[i].frame <= 180 && g_fs_hist[i].hits > 0) idx[n++] = i;
+    for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n; j++)
+            if (g_fs_hist[idx[j]].hits > g_fs_hist[idx[i]].hits) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
+    if (n > max) n = max;
+    for (int i = 0; i < n; i++) {
+        FsHist *e = &g_fs_hist[idx[i]];
+        hashes[i] = e->hash; hits[i] = e->hits; w[i] = e->w; h[i] = e->h; nc[i] = e->ncolor; dp[i] = e->depth;
+    }
+    return n;
+}
+// Grass in BOTW's overworld: instanced draws into the G-buffer (3+ color targets with depth) that sample the
+// R16G16B16A16_UNORM terrain/wind placement texture in the vertex shader (see textures.c vk_format_filters_linear:
+// "BOTW's grass reads one in its vertex shader").
+static bool draw_is_grass(Prog *pr, CmdRec *r, bool indexed) {
+    if (!g_settings.skip_grass || !pr || !pr->vi || pr->vi->ntex == 0) return false;
+    if (!st.rt.depth || st.rt.ncolor < 2) return false;
+    uint32_t inst = (uint32_t)(indexed ? r->x[6] : r->x[4]);
+    if (inst <= 1) return false;
+    return true;
+}
+// Skip the game's own internal dynamic resolution scale target refresh when our lower dyn_min floor is active.
+static __attribute__((unused)) bool skip_dyn_refresh(void) {
+    return g_settings.res_mode == RES_DYNAMIC && g_settings.dyn_min > 0 && g_settings.dyn_min < 50;
+}
+// Check if a fragment shader hash is in the active Performance shader groups (shader_groups.h).
+static bool sg_skip(uint64_t h) {
+    if (!h) return false;
+    if (g_settings.particles >= 1 && SG_HAS(SG_PARTICLES, h)) return true;
+    if (g_settings.no_ambient && SG_HAS(SG_AMBIENT, h)) return true;
+    if (g_settings.skip_named && SG_HAS(SG_NAMED, h)) return true;
+    return false;
+}
+// Runtime state heuristics for Particles and Environmental effects:
+// In BOTW, particles and weather/fog sheets are drawn into the 3D scene (with depth bound for soft-depth testing)
+// into 1-2 color targets (never the 3+ target G-buffer, and never HUD/post-process passes which have no depth),
+// with depth write off (st.ds[0] && !st.ds[1]) and color blending enabled (st.color_state[0] & 1).
+static bool fx_heuristic(CmdRec *r, bool indexed) {
+    if (g_settings.particles == 0 && !g_settings.no_ambient) return false;
+    if (!st.rt.depth || st.rt.ncolor < 1 || st.rt.ncolor > 2) return false;
+    NvnTexture *ct = st.rt.color[0];
+    if (!ct || ct->width < 160 || ct->height < 90) return false;
+    if (renderer_texture_presented(ct)) return false;
+    bool depth_test = st.ds[0] != 0, depth_write = st.ds[1] != 0;
+    bool blend_on = (st.color_state[0] & 1) != 0;
+    if (!depth_test || depth_write || !blend_on) return false;
+    uint32_t count = (uint32_t)r->x[2];
+    uint32_t inst = (uint32_t)(indexed ? r->x[6] : r->x[4]);
+    if (inst == 0) inst = 1;
+    uint8_t dst_c = st.blend[0][2];
+    bool additive = (dst_c == 2);
+    if (g_settings.particles == 2) {
+        if (inst > 1 || additive || count >= 6) return true;
+    } else if (g_settings.particles == 1) {
+        if (inst >= 4 || (additive && count >= 12) || count >= 48) return true;
+    }
+    if (g_settings.no_ambient) {
+        if (additive || (inst == 1 && count >= 3 && count <= 6)) return true;
+    }
+    return false;
+}
+// True if the current render target setup is a depth-only shadow pass (either ncolor == 0, or all color slots are NULL
+// on a square >= 256x256 depth target).
+static bool rt_is_shadow_pass(void) {
+    if (!st.rt.depth) return false;
+    if (st.rt.ncolor == 0) return true;
+    for (int i = 0; i < st.rt.ncolor && i < 8; i++)
+        if (st.rt.color[i]) return false;
+    return st.rt.depth->width >= 256 && st.rt.depth->width == st.rt.depth->height;
+}
+// Thin instanced clutter / foliage draws in the main 3D scene when Geometry detail is Reduced (1) or Low (2).
+static uint32_t geo_thin_inst(uint32_t inst) {
+    int gd = g_settings.geo_detail;
+    if (gd <= 0 || inst < 4 || !st.rt.depth || st.rt.ncolor < 2) return inst;
+    if (gd == 1 && inst >= 8) return inst / 2;
+    if (gd >= 2 && inst >= 4) return (inst + 3) / 4;
+    return inst;
+}
+#endif
+
 static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
     draw_(r, indexed);
@@ -8129,6 +8304,37 @@ static void draw_(CmdRec *r, bool indexed) {
             }
         }
         for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { stat_skipped++; return; }
+#ifdef __ANDROID__
+        fs_hist_note(last_hash);
+        if (g_settings.skip_shadows && (rt_is_shadow_pass() || last_hash == 0x3b4a13d3f35852f8ull ||
+                                        last_hash == 0x9f7e15ce0e7329b9ull || last_hash == 0x713a8d1b2e7da299ull)) {
+            stat_skipped++;
+            return;
+        }
+        if (draw_is_grass(pr, r, indexed)) { stat_skipped++; return; }
+        if (sg_skip(last_hash)) { stat_skipped++; return; }
+        if (fx_heuristic(r, indexed)) { stat_skipped++; return; }
+        if (g_settings.skip_fs[0]) {
+            static char prev_str[256];
+            static uint64_t live_skip[64];
+            static int n_live;
+            if (strcmp(prev_str, g_settings.skip_fs) != 0) {
+                snprintf(prev_str, sizeof prev_str, "%s", g_settings.skip_fs);
+                n_live = 0;
+                for (const char *p = prev_str; *p && n_live < 64;) {
+                    while (*p == ',' || *p == ' ' || *p == '+') p++;
+                    if (!*p) break;
+                    char *end = NULL;
+                    uint64_t v = strtoull(p, &end, 16);
+                    if (end == p) break;
+                    if (v) live_skip[n_live++] = v;
+                    p = end;
+                }
+            }
+            for (int i = 0; i < n_live; i++)
+                if (last_hash == live_skip[i]) { stat_skipped++; return; }
+        }
+#endif
         {   // LARECOMP_SKIPVS=1 (diagnosis): build/skipvs.txt lists vertex shader code addresses ("3da039b00,3da258600";
             // empty: none) whose draws are skipped - re-read twice a second, so a draw can be found by toggling it while
             // the game runs
@@ -9072,6 +9278,9 @@ static void draw_(CmdRec *r, bool indexed) {
 
     if (prof) prof_vtx += SDL_GetTicksNS() - prof_t2_;
     // ---- draw
+#ifdef __ANDROID__
+    inst = geo_thin_inst(inst);
+#endif
     if (!use_index) vkCmdDraw(cb, count, inst, first, base_inst);
     else vkCmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
     if (g_debug_frame) pick_after_draw();
@@ -10212,6 +10421,11 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         }
         case CMD_CLEAR_DEPTH_STENCIL:
+#ifdef __ANDROID__
+            if (g_settings.skip_shadows && rt_is_shadow_pass() && st.rt.depth->width >= 256 &&
+                st.rt.depth->width == st.rt.depth->height)
+                break;
+#endif
             if (st.rt.depth) { snap_reason = "clear-depth"; snapshots_invalidate(st.rt.depth); }
             if (ct_on() && st.rt.depth)
                 LOG("[ct] clear-depth %p d%d s%d sc %d %d %d %d\n", (void *)st.rt.depth, r->x[0] != 0, r->x[2] != 0, st.scissor[0][0],

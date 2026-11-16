@@ -61,6 +61,28 @@ typedef struct {
                           // (its Automatic: on for any Turnip that can place it - vulkan/device.c vk_turnip_heap_on)
     int inplace_reads;    // Turnip: draws sample targets they write as they are (vulkan/exec.c resolve_feedback); off: copies
     int turnip_lrz;       // Turnip's low-resolution Z; off: TU_DEBUG=nolrz before the driver loads (vulkan/device.c)
+    int low_ram;          // Low-RAM mode (vulkan/exec.c vk_low_ram): -1 Automatic (< 4 GB), 1 On, 0 Off
+    bool skip_shadows;    // Skip depth-only shadow passes & shadow map lookups (vulkan/exec.c, textures.c)
+    char skip_fs[256];    // Comma-separated fragment shader hashes to skip live (vulkan/exec.c)
+    bool skip_grass;      // Skip grass blade instanced draws in the overworld (vulkan/exec.c)
+    int tex_quality;      // Texture mip level: 0 Auto (half on low RAM), 1 Low (always half), 2 Normal (full)
+    int aniso_cap;        // Anisotropic filtering cap: 0 Game's (up to 16x), 1 Off (1x), 2 2x, 4 4x, 8 8x
+    int particles;        // Particle effects: 0 Normal, 1 Low (skip heavy/dense), 2 Off (skip all)
+    bool no_ambient;      // Turn off ambient / weather / fog / dust effect passes
+    bool skip_named;      // Skip known non-essential effect shaders (sparkles, heat haze, soft decals)
+    int vc_budget_mb;     // Vertex cache GPU memory budget in MB: 0 Auto, or 128..1024
+    bool framepace_off;   // Turn off the runtime's frame pacer (game's own 30/20 fps clock)
+    int shader_workers;   // Background shader compile threads: 0 Auto, 1..4 fixed count
+    int compile_prio;     // Shader compile thread priority: -1 Low (less stutter), 0 Normal, 1 High (faster compile)
+    int geo_detail;       // Instanced clutter / foliage density: 0 Normal, 1 Reduced (half), 2 Low (quarter)
+    int tex_cap;          // Max texture resolution: 0 None, 1024, 512, 256 (skips top mips of larger textures)
+    bool vc_aggressive;   // Aggressive vertex cache: keep static geometry cached 4x longer between page checks
+    int render_dist;      // Camera far clip distance: 0 Normal, 1 75%, 2 50%, 3 30%
+    int fps_limit;        // Custom frame rate cap: 0 Off (use Frame rate), 15, 20, 25, 30, 40, 45, 60
+    int pace_mode;        // Frame pacing mode: 0 Smooth (steered grid), 1 Strict grid (no phase steer), 2 Unpaced (no sleep)
+    int dyn_min;          // Dynamic resolution floor %: 50 (default), 35, 25, 60, 75
+    int dyn_target;       // Dynamic resolution target fps: 0 Auto (follows Frame rate), 30, 45, 60
+    bool perf_r16_init;   // One-time Mali-G57 / Helio G99 performance preset migration marker
     bool log_file;        // the log in a file as well (platform/android.c), to send with a report
     bool vk_prof;         // [vkprof] CPU/GPU per-stage counters every 2 s (vulkan/exec.c); LARECOMP_VK_PROF overrides
     char gpu_model[64];   // the GPU of the last start ("Adreno (TM) 830v1"): turnip_lrz's Automatic, before the driver

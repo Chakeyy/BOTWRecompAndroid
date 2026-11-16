@@ -59,10 +59,21 @@ Settings g_settings = {
     .gpu_heap = -1,
     .inplace_reads = -1,
     .turnip_lrz = -1,
+    .low_ram = 1,
+    .skip_shadows = true,
+    .particles = 1,
+    .no_ambient = true,
+    .geo_detail = 1,
+    .tex_quality = 1,
+    .aniso_cap = 1,
+    .shader_workers = 2,
+    .compile_prio = -1,
+    .vc_aggressive = true,
+    .dyn_min = 50,
+    .dyn_target = 30,
     .event_fps_unlock = false,  // (some events count frames: hle/framepace.c in_event)
     .fps_mode = 1,  // (30: the game's own choice dropped the overworld to 20, where the GPU's clocks settled low)
-    .res_mode = 1,  // (1x: the Switch's 900p scene, the HUD at the screen's resolution - Match display drew the scene at
-                    // 2560x1440 on the POCO F7 Ultra: 22 fps)
+    .res_mode = RES_DYNAMIC,  // (Dynamic resolution with 50% floor & 30 fps target by default on mobile GPUs)
 #else
     .show_fps = false,
 #endif
@@ -237,6 +248,27 @@ void settings_reset_defaults(void) {
     g_settings.sync_lag = d->sync_lag;
     g_settings.native_code = d->native_code;
     g_settings.files_in_place = d->files_in_place;
+    g_settings.skip_shadows = d->skip_shadows;
+    g_settings.skip_fs[0] = 0;
+    g_settings.skip_grass = d->skip_grass;
+    g_settings.tex_quality = d->tex_quality;
+    g_settings.aniso_cap = d->aniso_cap;
+    g_settings.particles = d->particles;
+    g_settings.no_ambient = d->no_ambient;
+    g_settings.skip_named = d->skip_named;
+    g_settings.vc_budget_mb = d->vc_budget_mb;
+    g_settings.framepace_off = d->framepace_off;
+    g_settings.shader_workers = d->shader_workers;
+    g_settings.compile_prio = d->compile_prio;
+    g_settings.geo_detail = d->geo_detail;
+    g_settings.tex_cap = d->tex_cap;
+    g_settings.vc_aggressive = d->vc_aggressive;
+    g_settings.render_dist = d->render_dist;
+    g_settings.fps_limit = d->fps_limit;
+    g_settings.pace_mode = d->pace_mode;
+    g_settings.dyn_min = d->dyn_min;
+    g_settings.dyn_target = d->dyn_target;
+    g_settings.low_ram = d->low_ram;
 #endif
 }
 
@@ -292,6 +324,28 @@ void settings_load(void) {
         else if (!strcmp(key, "gpu_heap")) g_settings.gpu_heap = !strcmp(val, "auto") ? -1 : atoi(val) != 0;
         else if (!strcmp(key, "inplace_reads")) g_settings.inplace_reads = !strcmp(val, "auto") ? -1 : atoi(val) != 0;
         else if (!strcmp(key, "turnip_lrz")) g_settings.turnip_lrz = !strcmp(val, "auto") ? -1 : atoi(val) != 0;
+        else if (!strcmp(key, "low_ram")) g_settings.low_ram = !strcmp(val, "auto") ? -1 : atoi(val) != 0;
+        else if (!strcmp(key, "skip_shadows")) g_settings.skip_shadows = atoi(val) != 0;
+        else if (!strcmp(key, "skip_fs")) snprintf(g_settings.skip_fs, sizeof g_settings.skip_fs, "%s", val);
+        else if (!strcmp(key, "skip_grass")) g_settings.skip_grass = atoi(val) != 0;
+        else if (!strcmp(key, "tex_quality")) g_settings.tex_quality = atoi(val);
+        else if (!strcmp(key, "aniso_cap")) g_settings.aniso_cap = atoi(val);
+        else if (!strcmp(key, "particles")) g_settings.particles = atoi(val);
+        else if (!strcmp(key, "no_ambient")) g_settings.no_ambient = atoi(val) != 0;
+        else if (!strcmp(key, "skip_named")) g_settings.skip_named = atoi(val) != 0;
+        else if (!strcmp(key, "vc_budget_mb")) g_settings.vc_budget_mb = atoi(val);
+        else if (!strcmp(key, "framepace_off")) g_settings.framepace_off = atoi(val) != 0;
+        else if (!strcmp(key, "shader_workers")) g_settings.shader_workers = atoi(val);
+        else if (!strcmp(key, "compile_prio")) g_settings.compile_prio = atoi(val);
+        else if (!strcmp(key, "geo_detail")) g_settings.geo_detail = atoi(val);
+        else if (!strcmp(key, "tex_cap")) g_settings.tex_cap = atoi(val);
+        else if (!strcmp(key, "vc_aggressive")) g_settings.vc_aggressive = atoi(val) != 0;
+        else if (!strcmp(key, "render_dist")) g_settings.render_dist = atoi(val);
+        else if (!strcmp(key, "fps_limit")) g_settings.fps_limit = atoi(val);
+        else if (!strcmp(key, "pace_mode")) g_settings.pace_mode = atoi(val);
+        else if (!strcmp(key, "dyn_min")) g_settings.dyn_min = atoi(val);
+        else if (!strcmp(key, "dyn_target")) g_settings.dyn_target = atoi(val);
+        else if (!strcmp(key, "perf_r16_init")) g_settings.perf_r16_init = atoi(val) != 0;
         else if (!strcmp(key, "log_file")) g_settings.log_file = atoi(val) != 0;
         else if (!strcmp(key, "vk_prof")) g_settings.vk_prof = atoi(val) != 0;
         else if (!strcmp(key, "gpu_model")) snprintf(g_settings.gpu_model, sizeof g_settings.gpu_model, "%s", val);
@@ -373,6 +427,24 @@ void settings_load(void) {
     if (g_settings.volume > 2) g_settings.volume = 2;
 #ifdef __ANDROID__
     g_settings.native_code = true;  // (native-only APK build: always run in NCE Native Mode)
+    if (!g_settings.perf_r16_init) {
+        g_settings.perf_r16_init = true;
+        g_settings.sync_lag = true;
+        g_settings.low_ram = 1;
+        g_settings.skip_shadows = true;
+        g_settings.particles = 1;
+        g_settings.no_ambient = true;
+        g_settings.geo_detail = 1;
+        g_settings.tex_quality = 1;
+        g_settings.aniso_cap = 1;
+        g_settings.shader_workers = 2;
+        g_settings.compile_prio = -1;
+        g_settings.vc_aggressive = true;
+        g_settings.res_mode = RES_DYNAMIC;
+        g_settings.dyn_min = 50;
+        g_settings.dyn_target = 30;
+        settings_save();
+    }
 #endif
     LOG("[settings] loaded %s\n", SETTINGS_FILE);
 }
@@ -406,8 +478,13 @@ void settings_save(void) {
             g_settings.sync_lag, g_settings.native_code, g_settings.files_in_place);
     static const char *const tri[] = {"auto", "0", "1"};  // (-1 / 0 / 1)
 #define TRI(v) tri[(v) < 0 ? 0 : (v) ? 2 : 1]
-    fprintf(f, "gpu_heap = %s\ninplace_reads = %s\nturnip_lrz = %s\nlog_file = %d\nvk_prof = %d\ngpu_model = %s\n", TRI(g_settings.gpu_heap),
-            TRI(g_settings.inplace_reads), TRI(g_settings.turnip_lrz), g_settings.log_file, g_settings.vk_prof, g_settings.gpu_model);
+    fprintf(f, "gpu_heap = %s\ninplace_reads = %s\nturnip_lrz = %s\nlow_ram = %s\nskip_shadows = %d\nskip_fs = %s\nskip_grass = %d\ntex_quality = %d\naniso_cap = %d\nparticles = %d\nno_ambient = %d\nskip_named = %d\nvc_budget_mb = %d\nframepace_off = %d\nshader_workers = %d\ncompile_prio = %d\ngeo_detail = %d\ntex_cap = %d\nvc_aggressive = %d\nrender_dist = %d\nfps_limit = %d\npace_mode = %d\ndyn_min = %d\ndyn_target = %d\nperf_r16_init = %d\nlog_file = %d\nvk_prof = %d\ngpu_model = %s\n",
+            TRI(g_settings.gpu_heap), TRI(g_settings.inplace_reads), TRI(g_settings.turnip_lrz), TRI(g_settings.low_ram),
+            g_settings.skip_shadows, g_settings.skip_fs, g_settings.skip_grass, g_settings.tex_quality, g_settings.aniso_cap,
+            g_settings.particles, g_settings.no_ambient, g_settings.skip_named, g_settings.vc_budget_mb, g_settings.framepace_off,
+            g_settings.shader_workers, g_settings.compile_prio, g_settings.geo_detail, g_settings.tex_cap, g_settings.vc_aggressive,
+            g_settings.render_dist, g_settings.fps_limit, g_settings.pace_mode, g_settings.dyn_min, g_settings.dyn_target,
+            g_settings.perf_r16_init ? 1 : 0, g_settings.log_file, g_settings.vk_prof, g_settings.gpu_model);
     fprintf(f, "driver_env = %s\nheap_file = %d\n", g_settings.driver_env, g_settings.heap_file);
 #undef TRI
     fprintf(f, "touch_drag_camera = %d\ntouch_drag_sens = %.2f\ntouch_sticks_hidden = %d\ntouch_half_areas = %d\n",

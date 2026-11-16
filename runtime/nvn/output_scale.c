@@ -25,6 +25,13 @@
 
 // Dynamic resolution: a factor on the Match display scale, 0.5 .. 1 in 0.05 steps.
 static double g_dyn = 1.0;
+static double dyn_floor(void) {
+#ifdef __ANDROID__
+    int m = g_settings.dyn_min;
+    if (m >= 20 && m <= 90) return m / 100.0;
+#endif
+    return 0.5;
+}
 static double g_dyn_gpu_sum, g_dyn_dt_sum, g_last_t;
 static int g_dyn_n, g_dyn_gpu_n, g_dyn_good;
 static double g_dyn_cool_until, g_dyn_probe_wait = 5.0, g_dyn_probe_at;
@@ -39,6 +46,8 @@ static void dyn_update(double now, double gpu_ms) {
     // the frame rate it keeps: 60 with Frame rate at 60 fps, else 30 - Auto's 60 comes by itself where the GPU has room.
     // (Aiming at Auto's tries for 60 took the scale to its floor while the game stayed at 30: POCO F7 Ultra, 2026-10-25)
     want = g_settings.fps_mode == 2 || g_settings.fps_mode == 4 ? want : g_settings.fps_mode == 3 ? 1000.0 / 20 : 1000.0 / 30;  // (45: its 22 ms)
+    if (g_settings.fps_limit > 0) want = 1000.0 / g_settings.fps_limit;
+    if (g_settings.dyn_target > 0) want = 1000.0 / g_settings.dyn_target;
 #endif
     g_dyn_dt_sum += dt;
     g_dyn_n++;
@@ -54,7 +63,7 @@ static void dyn_update(double now, double gpu_ms) {
     bool slow = avg_gpu >= 0 ? avg_gpu > want * 0.87 || (avg_dt > want * 1.08 && avg_gpu > want * 0.7)
                              : avg_dt > want * 1.04;
     if (slow) {
-        g_dyn = fmax(0.5, g_dyn - (avg_dt > want * 1.3 ? 0.1 : 0.05));
+        g_dyn = fmax(dyn_floor(), g_dyn - (avg_dt > want * 1.3 ? 0.1 : 0.05));
         g_dyn_good = 0;
         if (now - g_dyn_last_raise < 3.0) g_dyn_probe_wait = fmin(g_dyn_probe_wait * 2, 60.0);  // raised too eagerly
     } else if (g_dyn < 1.0) {
@@ -94,10 +103,11 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
         if (env_lines < 0) env_lines = getenv("LARECOMP_OUT_LINES") ? atof(getenv("LARECOMP_OUT_LINES")) : 0;
         double auto_cap = 1080;
 #ifdef __ANDROID__
-        {   // Entry/mid Mali GPUs (G3x / G5x, e.g. Mali-G57 MC2) are strongly fillrate-bound at 1080p: Auto caps at 720p.
+        {   // Weak GPUs (RAM saving on, or entry/mid Mali G3x/G5x) are strongly fillrate-bound at 1080p: Auto caps at 720p.
+            extern bool vk_low_ram(void);
             extern const char *vk_gpu_name(void);
             const char *gpu = vk_gpu_name();
-            if (gpu && (strstr(gpu, "Mali-G5") || strstr(gpu, "Mali-G3"))) auto_cap = 720;
+            if (vk_low_ram() || (gpu && (strstr(gpu, "Mali-G5") || strstr(gpu, "Mali-G3")))) auto_cap = 720;
         }
 #endif
         out_auto = env_lines <= 0 && g_settings.out_lines == OUT_AUTO;  // (Auto: 1080 lines at most, or 720 on entry Mali)

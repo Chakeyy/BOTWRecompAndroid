@@ -10,7 +10,7 @@
 
 void opt_begin(const char *id, float scale);
 void opt_section(const char *title);
-bool opt_toggle(const char *label, bool *v, bool def, const char *desc);
+bool opt_toggle(const char *label, bool *v, bool def, const char *desc, bool wrap = false, const char *on_s = "On", const char *off_s = "Off");
 // wrap: past the last value back to the first (and the other way); false: stops at the ends
 bool opt_choice(const char *label, int *v, const char *const *names, int n, int def, const char *desc, bool wrap = true);
 // steps of `step` between lo and hi; fmt formats the value (e.g. "%gx")

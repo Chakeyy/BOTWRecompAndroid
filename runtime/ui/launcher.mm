@@ -596,6 +596,7 @@ extern "C" const char *vk_driver_rejected(void);  // (runtime/nvn/vulkan/android
 extern "C" const char *vk_driver_desc(void);      // (its own name and version: runtime/nvn/vulkan/device.c)
 extern "C" bool vk_driver_is_turnip(void);
 extern "C" const char *vk_gpu_desc(void);  // ("Adreno (TM) 830 - Turnip")
+extern "C" bool vk_low_ram_auto(void);
 static std::string g_log_folder;  // its name ("Download/BOTWRecomp"), "" with none
 static bool g_log_folder_read;
 
@@ -1660,6 +1661,13 @@ static void prelaunch_tab(float sc) {
         std::string folder = g_log_folder;
         pthread_mutex_unlock(&g_lock);
         ImGui::Spacing();
+        extern bool vk_low_ram_auto(void);
+        ImGui::TextUnformatted(tr("RAM saving"));
+        if (tri("lowram", &g_settings.low_ram, vk_low_ram_auto())) changed = true;
+        ImGui::TextDisabled("%s", tr("Uses less RAM and GPU memory: half-size mipmapped textures and smaller buffers "
+                                     "(for phones with 4-8 GB of RAM, or when the system closes the app). Takes effect "
+                                     "after restarting the app."));
+        ImGui::Spacing();
         if (ImGui::Checkbox(tr("Vulkan profiler"), &g_settings.vk_prof)) changed = true;
         ImGui::TextDisabled("%s", tr("Logs per-stage CPU/GPU timings, descriptor cache hits, and pass restarts every 2 s "
                                      "to botwrecomp-log.txt (LARECOMP_VK_PROF; applied at game start)."));
@@ -1837,6 +1845,13 @@ static void prelaunch_tab(float sc) {
         ImGui::SameLine();
         if (ImGui::Button(tr("Use substitute font"))) remove_fonts();
     }
+}
+
+extern "C" void launcher_restart_app(void) {
+#ifdef __ANDROID__
+    settings_save();
+    android_call("restartApp");
+#endif
 }
 
 extern "C" void launcher_run(const char *root) {

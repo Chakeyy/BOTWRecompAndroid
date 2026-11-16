@@ -304,8 +304,9 @@ static int row(const char *label, const std::string &value, bool changed, const 
     return step;
 }
 
-bool opt_toggle(const char *label, bool *v, bool def, const char *desc) {
-    if (!row(label, *v ? "On" : "Off", *v != def, desc)) return false;  // (any step flips it)
+bool opt_toggle(const char *label, bool *v, bool def, const char *desc, bool wrap, const char *on_s, const char *off_s) {
+    (void)wrap;
+    if (!row(label, *v ? on_s : off_s, *v != def, desc)) return false;  // (any step flips it)
     *v = !*v;
     return true;
 }

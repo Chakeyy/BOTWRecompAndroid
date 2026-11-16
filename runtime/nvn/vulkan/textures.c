@@ -11,6 +11,7 @@
 #endif
 
 #include "vk.h"
+#include "../../settings.h"
 #include "../astc.h"
 #include "../renderer.h"
 #include "../texpatch.h"
@@ -572,12 +573,17 @@ static void create_image(NvnTexture *t, TexBackend *b) {
             }
             if (half) LOG("[vk] textures from their second level (>=%dx%d): %s\n", min_dim, min_dim, vk_low_ram() ? "low RAM" : "Mali conservation");
         }
+        bool use_half = half;
+#ifdef __ANDROID__
+        if (g_settings.tex_quality == 1) use_half = true;
+        else if (g_settings.tex_quality == 2) use_half = false;
+#endif
         b->skip = 0;
         // Only block-compressed ones (BC / ASTC: colours, materials, most of the memory): an uncompressed one may be data
         // a shader reads texel by texel - the terrain's heights (R16, 1024x1024x8) at half size left the ground around
         // Link missing (Galaxy Tab A9+, 2026-11-13).
         bool compressed = t->layout.fmt && t->layout.fmt->bw > 1;
-        if (half && compressed && !depthfmt && b->rs_group == RS_NONE && !(t->flags & (8 | 0x50)) && type == VK_IMAGE_TYPE_2D &&
+        if (use_half && compressed && !depthfmt && b->rs_group == RS_NONE && !(t->flags & (8 | 0x50)) && type == VK_IMAGE_TYPE_2D &&
             samples == 1 && levels >= 2 && t->layout.levels >= 2 && tw >= (uint32_t)min_dim && th >= (uint32_t)min_dim) {
             tw >>= 1, th >>= 1, levels--, b->skip = 1;
 #ifdef __ANDROID__
@@ -588,6 +594,15 @@ static void create_image(NvnTexture *t, TexBackend *b) {
             }
 #endif
         }
+#ifdef __ANDROID__
+        uint32_t cap_dim = (uint32_t)g_settings.tex_cap;
+        if (cap_dim >= 256 && compressed && !depthfmt && b->rs_group == RS_NONE && !(t->flags & (8 | 0x50)) &&
+            type == VK_IMAGE_TYPE_2D && samples == 1) {
+            while ((tw > cap_dim || th > cap_dim) && levels >= 2 && b->skip + 1 < t->layout.levels && tw >= 64 && th >= 64) {
+                tw >>= 1; th >>= 1; levels--; b->skip++;
+            }
+        }
+#endif
     }
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .pNext = fixed && twin ? &fl : NULL,
                             .flags = flags, .imageType = type, .format = vf,
@@ -1901,6 +1916,10 @@ static VkSampler make_sampler(const NvnSamplerDesc *d, bool compare) {
         cap_aniso = ae ? (float)atof(ae) : (g_vk.props.vendorID == 0x13B5 ? 1.0f : 16.0f);
     }
     float aniso = fminf(d->max_aniso, cap_aniso);
+#ifdef __ANDROID__
+    if (g_settings.aniso_cap > 0 && aniso > (float)g_settings.aniso_cap)
+        aniso = (float)g_settings.aniso_cap;
+#endif
     if (aniso > 1.0f) { si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = aniso; }
     static float lodmin = -1;
     if (lodmin < 0) lodmin = getenv("LARECOMP_LOD_MIN") ? (float)atof(getenv("LARECOMP_LOD_MIN")) : 0;
@@ -1910,7 +1929,12 @@ static VkSampler make_sampler(const NvnSamplerDesc *d, bool compare) {
     if (stest && mf > 1) { si.minLod = 0; si.maxLod = VK_LOD_CLAMP_NONE; si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = 16; }
     if (d->compare_mode && compare) {
         si.compareEnable = VK_TRUE;
-        si.compareOp = getenv("LARECOMP_NO_SHADOW") ? VK_COMPARE_OP_ALWAYS : compare_op(d->compare_func);
+#ifdef __ANDROID__
+        bool no_sh = g_settings.skip_shadows || getenv("LARECOMP_NO_SHADOW");
+#else
+        bool no_sh = getenv("LARECOMP_NO_SHADOW") != NULL;
+#endif
+        si.compareOp = no_sh ? VK_COMPARE_OP_ALWAYS : compare_op(d->compare_func);
     }
     VkSamplerCustomBorderColorCreateInfoEXT cb = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
     if (border) {
