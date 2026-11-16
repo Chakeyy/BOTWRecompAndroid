@@ -178,6 +178,7 @@ void vk_defer_view(VkImageView v);
 void vk_views_forget(TexBackend *b);  // drop (deferred) the cached views of an image being replaced
 void vk_pend_clear_forget(TexBackend *b);
 void vk_flush_tex_clear(TexBackend *b);
+void vk_flush_all_pending_clears(void);
 uint64_t vk_frame_counter(void);
 
 // ---- shaders / pipelines (shaders.c)

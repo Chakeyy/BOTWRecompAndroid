@@ -2701,7 +2701,7 @@ void vk_flush_tex_clear(TexBackend *b) {
         st.rt_dirty = true;
     }
     VkCommandBuffer cb = vk_cmd();
-    if (vk_narrow_pass_barrier_on() && !g_pass_wrote_non_rt && !naliases) vk_pass_barrier_fragment(cb);
+    if (vk_narrow_pass_barrier_on() && !g_pass_wrote_non_rt) vk_pass_barrier_fragment(cb);
     else vk_full_barrier(cb);
     if (do_c && (b->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) {
         VkClearColorValue cv;
@@ -2724,8 +2724,12 @@ void vk_flush_tex_clear(TexBackend *b) {
     }
 }
 
-static void vk_flush_all_pending_clears(void) {
+void vk_flush_all_pending_clears(void) {
     while (n_pend_clear > 0) vk_flush_tex_clear(pend_clear_list[n_pend_clear - 1]);
+}
+
+bool vk_sync_lag_allowed(void) {
+    return g_vk.props.vendorID != 0x13B5 && !gcopy_mode;
 }
 
 static void sync_rt_scale(void) {
@@ -2830,7 +2834,7 @@ static void begin_pass(void) {
     if (no_barrier < 0) no_barrier = getenv("LARECOMP_VK_NO_PASS_BARRIER") != NULL;
     extern int vk_ab(const char *what);
     if (!no_barrier && AB("nobarrier") != 1) {  // passes, copies and dispatches see each other's results
-        if (vk_narrow_pass_barrier_on() && !g_pass_wrote_non_rt && !naliases) vk_pass_barrier_fragment(cb);
+        if (vk_narrow_pass_barrier_on() && !g_pass_wrote_non_rt) vk_pass_barrier_fragment(cb);
         else vk_full_barrier(cb);
     }
     g_pass_wrote_non_rt = false;
@@ -2953,6 +2957,7 @@ static void begin_pass(void) {
     if (!w) { pass_sx = pass_sy = 1; minw = minh = 16; }
     pass_w = minw; pass_h = minh;
     if (n_pend_clear) {
+        bool flushed_bound = false;
         for (int i = 0; i < st.rt.ncolor; i++) {
             NvnTexture *t = st.rt.color[i];
             TexBackend *b = t ? t->backend : NULL;
@@ -2963,6 +2968,9 @@ static void begin_pass(void) {
                 ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
                 memcpy(ca[i].clearValue.color.float32, b->clear_color, 16);
                 vk_pend_clear_forget(b);
+            } else {
+                vk_flush_tex_clear(b);
+                flushed_bound = true;
             }
         }
         if (st.rt.depth && st.rt.depth->backend) {
@@ -2982,13 +2990,14 @@ static void begin_pass(void) {
                     b->pend_clear_stencil = false;
                 }
                 if (!b->pend_clear_depth && !b->pend_clear_stencil) vk_pend_clear_forget(b);
+            } else if (b->pend_clear_depth || b->pend_clear_stencil) {
+                vk_flush_tex_clear(b);
+                flushed_bound = true;
             }
         }
-        if (n_pend_clear) {
-            vk_flush_all_pending_clears();
+        if (flushed_bound) {
             cb = vk_cmd();
-            if (vk_narrow_pass_barrier_on() && !naliases) vk_pass_barrier_fragment(cb);
-            else vk_full_barrier(cb);
+            vk_full_barrier(cb);
             g_pass_wrote_non_rt = false;
         }
     }
@@ -4603,6 +4612,8 @@ static void alias_copy(CopyAlias *a, VkImageAspectFlags aspects, const char *why
     gp_mark(cb, "copy texture (deferred, %s%s) %ux%u", why, aspects == d->aspect ? "" : ", stencil only", a->dst->width, a->dst->height);
     VkImageCopy c = {.srcSubresource = {aspects, 0, 0, 1}, .dstSubresource = {aspects, 0, 0, 1}, .extent = {d->width, d->height, 1}};
     vkCmdCopyImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    g_pass_wrote_non_rt = true;
+    g_gpu_write_serial++;
     if (aspects == d->aspect) stat_alias_copied++; else stat_alias_partial++;
     if (ct_on()) LOG("[ct] alias copy %p -> %p aspects %#x (%s)\n", (void *)a->src, (void *)a->dst, aspects, why);
 }
@@ -4735,19 +4746,19 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
     typedef struct {
         Prog *pr;
         uint64_t rt_ver, t0_ver, t1_ver, u0_ver, u1_ver, pool_ver, gcopy_ver, u0_data_ver, u1_data_ver, exec_seq, frame;
-        uint32_t sgen;
+        uint32_t sgen, vgen;
         bool clean;
     } RfMemo;
     static RfMemo rf_memo[128];
     bool bindless = pr->vi_bindless || pr->fi_bindless;
-    uint64_t cur_frame = !always && !g_debug_frame && !naliases ? vk_frame_counter() : 0;
+    uint64_t cur_frame = !always && !g_debug_frame && !n_pend_clear ? vk_frame_counter() : 0;
     uint32_t rslot = (uint32_t)((((uintptr_t)pr * 0x9E3779B97F4A7C15ull) >> 32) ^
                                 (st_tex_ver[1] * 0xC2B2AE3Du) ^ (uint32_t)st_rt_ver) & 127u;
-    if (!always && !g_debug_frame && !naliases) {
+    if (!always && !g_debug_frame && !n_pend_clear) {
         RfMemo *m = &rf_memo[rslot];
         if (m->clean && m->pr == pr && m->rt_ver == st_rt_ver && m->t0_ver == st_tex_ver[0] &&
             m->t1_ver == st_tex_ver[1] && m->pool_ver == st_pool_ver && m->gcopy_ver == g_gpu_copy_ver && m->sgen == tex_slot_gen &&
-            m->frame == cur_frame &&
+            m->vgen == vk_view_gen && m->frame == cur_frame &&
             (!bindless || (m->u0_ver == st_ubuf_ver[0] && m->u1_ver == st_ubuf_ver[1] &&
                            m->u0_data_ver == st_stage_ubo_data_ver[0] &&
                            m->u1_data_ver == st_stage_ubo_data_ver[1] &&
@@ -4762,6 +4773,12 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
     for (int sg = 0; sg < 2; sg++)
         for (int i = 0; i < infos[sg]->ntex; i++) {
             NvnTexEntry *e = shader_texture_entry(sg, &infos[sg]->tex[i]);
+            if (n_pend_clear && e && e->tex && !is_attachment_entry(e)) {
+                NvnTexture *stx = naliases ? alias_read(e->tex) : e->tex;
+                TexBackend *sb = stx ? (TexBackend *)stx->backend : NULL;
+                if (sb && (sb->pend_clear_color || sb->pend_clear_depth || sb->pend_clear_stencil))
+                    vk_flush_tex_clear(sb);
+            }
             if (!is_attachment_entry(e)) continue;
             any_attachment = true;
             NvnTexture *t = e->tex;
@@ -4855,7 +4872,7 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
                 vk_end_pass();
                 vk_flush_all_pending_clears();
                 VkCommandBuffer pcb = vk_cmd();
-                if (vk_narrow_pass_barrier_on() && !g_pass_wrote_non_rt && !naliases) vk_pass_barrier_fragment(pcb);
+                if (vk_narrow_pass_barrier_on() && !g_pass_wrote_non_rt) vk_pass_barrier_fragment(pcb);
                 else vk_full_barrier(pcb);
                 g_pass_wrote_non_rt = false;
             }
@@ -4885,13 +4902,13 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
             snap_fb_dirty[si] = false;
             st.rt_dirty = true;
         }
-    if (!any_attachment && !always && !g_debug_frame && !naliases) {
+    if (!any_attachment && !always && !g_debug_frame && !n_pend_clear) {
         rf_memo[rslot] = (RfMemo){
             .pr = pr, .rt_ver = st_rt_ver, .t0_ver = st_tex_ver[0], .t1_ver = st_tex_ver[1],
             .u0_ver = st_ubuf_ver[0], .u1_ver = st_ubuf_ver[1], .pool_ver = st_pool_ver,
             .gcopy_ver = g_gpu_copy_ver, .u0_data_ver = st_stage_ubo_data_ver[0],
             .u1_data_ver = st_stage_ubo_data_ver[1], .exec_seq = g_exec_list_seq,
-            .frame = cur_frame, .sgen = tex_slot_gen, .clean = true,
+            .frame = cur_frame, .sgen = tex_slot_gen, .vgen = vk_view_gen, .clean = true,
         };
     }
 }
@@ -5992,6 +6009,7 @@ static GcBack gc_back[256];
 static int gc_nback;
 static pthread_mutex_t gc_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void vc_note_retire_write(uint64_t addr, uint64_t len);
 static void gcopy_retire(uint64_t done) {
     pthread_mutex_lock(&gc_lock);
     int k = 0;
@@ -5999,6 +6017,7 @@ static void gcopy_retire(uint64_t done) {
         if (gc_back[i].seq <= done) {
             if (!gc_back[i].shadow) {
                 memcpy((void *)(uintptr_t)gc_back[i].addr, gc_back[i].src, gc_back[i].len);
+                vc_note_retire_write(gc_back[i].addr, gc_back[i].len);
                 continue;
             }
             // (the arena: 256 bytes at a time, what the GPU changed since the last upload - the shadow - and the CPU
@@ -6016,6 +6035,7 @@ static void gcopy_retire(uint64_t done) {
                 if (!memcmp(src + b, sh + b, n) || memcmp(g + b, sh + b, n)) continue;  // (GPU unchanged / CPU wrote)
                 memcpy(g + b, src + b, n);
                 memcpy(sh + b, src + b, n);
+                vc_note_retire_write(gc_back[i].addr + b, n);
             }
         } else gc_back[k++] = gc_back[i];
     }
@@ -6835,6 +6855,15 @@ static void note_gmem_store(int stage) {
     LOG("%s\n", line);
 }
 
+static void vc_note_retire_write(uint64_t addr, uint64_t len) {
+    if (!len || !vc_page_gen || addr < HEAP_BASE || addr - HEAP_BASE >= HEAP_MAX) return;
+    uint64_t lo = (addr - HEAP_BASE) / VC_PAGE;
+    uint64_t hi = (addr - HEAP_BASE + len + VC_PAGE - 1) / VC_PAGE;
+    if (hi > HEAP_MAX / VC_PAGE) hi = HEAP_MAX / VC_PAGE;
+    uint32_t g = ++vc_gen;
+    for (uint64_t p = lo; p < hi; p++) vc_page_gen[p] = g;
+}
+
 static void vc_mark_sbufs(int stage) {
     for (int i = 0; i < 16; i++) {
         uint64_t a = st.sbuf[stage][i].addr, sz = st.sbuf[stage][i].size;
@@ -6895,14 +6924,14 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
         for (uint64_t p = lo / VC_PAGE; p < hi / VC_PAGE && !e->gpu; p++) e->gpu = vc_page_gpu[p];
         e->epoch = vc_epoch;
     }
-    if (e->gpu) { prof_vc_bypass++; return false; }
+    if (e->gpu && !cpu_fill) { prof_vc_bypass++; return false; }
     e->used_seq = pend;
     extern bool framepace_in_menu(void);
     uint32_t cur_frame32 = (uint32_t)vk_frame_counter() + 1u;
     if (!e->gen || e->used_frame != cur_frame32) {
         e->used_frame = cur_frame32;
         uint32_t idx = (uint32_t)(e - vc_tab);
-        uint32_t mask = e->clean_streak >= 16u ? 31u : e->clean_streak >= 4u ? 7u : 0u;
+        uint32_t mask = e->gpu ? 0u : e->clean_streak >= 16u ? 31u : e->clean_streak >= 4u ? 7u : 0u;
         if (!e->gen || !mask || ((cur_frame32 + idx) & mask) == 0u || framepace_in_menu())
             vc_pend[vc_npend++] = idx;
     }
@@ -7078,13 +7107,13 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     uint32_t fslot = (uint32_t)(((h * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)mflags * 0xC2B2AE3D27D4EB4Full)) >> 32) & 4095u;
     uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
     NvnTexEntry *e_pre = (h && st.tpool && tic < (uint32_t)st.tpool->count) ? &((NvnTexEntry *)st.tpool->entries)[tic] : NULL;
-    NvnTexture *t_pre = e_pre ? e_pre->tex : NULL;
+    NvnTexture *t_pre = e_pre && e_pre->tex ? (naliases ? alias_read(e_pre->tex) : e_pre->tex) : NULL;
     bool is_fb_tex = false;
-    if (t_pre) {
-        for (int k = 0; k < nfeedback; k++) if (feedback_tex[k] == t_pre) { is_fb_tex = true; break; }
-        if (!is_fb_tex && n_pass_fb && tex_in_pass_fb((const TexBackend *)t_pre->backend)) is_fb_tex = true;
+    if (e_pre && e_pre->tex) {
+        for (int k = 0; k < nfeedback; k++) if (feedback_tex[k] == e_pre->tex || feedback_tex[k] == t_pre) { is_fb_tex = true; break; }
+        if (!is_fb_tex && n_pass_fb && t_pre && tex_in_pass_fb((const TexBackend *)t_pre->backend)) is_fb_tex = true;
     }
-    bool can_full_memo = !nomemo && !naliases && !is_fb_tex && !scene_up.t && h && st.tpool && st.spool;
+    bool can_full_memo = !nomemo && !is_fb_tex && !scene_up.t && h && st.tpool && st.spool;
     if (can_full_memo) {
         TexFullMemo *fm = &full_memo[fslot];
         if (fm->handle == h && fm->frame == frame && fm->tpool == st.tpool && fm->spool == st.spool &&
@@ -7334,7 +7363,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     }
     uint64_t fii_stamp_cur = (stage == 1 && si->ntex) ? fii_memo_active_id : 0;
     bool can_fast = !fast_off && !set_cache_off && stage < 2 && !bindless && !si->uses_gmem_map &&
-                    !up_fix.sx && !naliases &&
+                    !up_fix.sx &&
                     (si->ntex == 0 || (!nfeedback && !n_pass_fb && !scene_up.t)) &&
                     (stage == 0 || !si->ntex || (pre_ii && fii_stamp_cur));
     if (can_fast && stage == 0) {
@@ -7830,7 +7859,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         }
     }
     vk_end_pass();
-    vk_flush_all_pending_clears();
+    if (cp->si->ntex && n_pend_clear) vk_flush_all_pending_clears();
 #ifdef __ANDROID__
     vk_bc_shadows_resolve(NULL, NULL, NULL, 0);  // (BC textures drawn into: decoded before anything outside a pass reads them)
 #endif
@@ -8754,7 +8783,7 @@ static void draw_(CmdRec *r, bool indexed) {
     static uint64_t next_fii_stamp = 1;
     fii_memo_active_id = 0;
     uint64_t fii_frame = vk_frame_counter();
-    bool can_fii_memo = !pr->fi_bindless && !nfeedback && !n_pass_fb && !naliases && !scene_up.t && pr->fi->ntex <= 64;
+    bool can_fii_memo = !pr->fi_bindless && !nfeedback && !n_pass_fb && !scene_up.t && pr->fi->ntex <= 64;
     if (can_fii_memo && pr->fi->ntex == 0) {
         fii_memo_active_id = 1;
     } else if (can_fii_memo) {
@@ -8934,19 +8963,33 @@ static void draw_(CmdRec *r, bool indexed) {
             if (iaddr % isz == 0 && guest_direct(iaddr, (uint64_t)count * isz, &ib.buf, &ib.off)) {
                 scan_src = src; scan_isz = isz; scan_restart = restart;  // max_index only if a stream gets copied
             } else {
-                ib = vk_transient_copy(src, (uint64_t)count * isz + 4, 4);
+                typedef struct { uint64_t addr, epoch, gcopy; uint32_t count, isz, restart, max_idx; VkSpan span; } IbScanMemo;
+                static IbScanMemo ib_memo[64];
+                uint32_t ibs = (uint32_t)(((iaddr >> 2) ^ ((uint64_t)count * 0x9E3779B9u)) & 63u);
+                IbScanMemo *im = &ib_memo[ibs];
+                if (active >= 0 && im->addr == iaddr && im->count == count && im->isz == isz &&
+                    im->restart == restart && im->epoch == chunk_epoch && im->gcopy == gcopy_gen &&
+                    im->span.buf == chunks[active].buf) {
+                    chunks[active].seq = vk_pending_seq();
+                    chunks[active].frame = renderer_present_count();
+                    ib = im->span;
+                    max_index = im->max_idx;
+                } else {
+                    ib = vk_transient_copy(src, (uint64_t)count * isz + 4, 4);
 #ifdef __ANDROID__
-                // (no primitive restart - most draws: a plain maximum, which the compiler vectorizes; the scalar
-                // loop with the restart test was ~9% of the render thread in the copy mode, every indexed draw)
-                if (!st.prim_restart) {
-                    uint32_t m = 0;
-                    if (isz == 2) { const uint16_t *s = src; for (uint32_t i = 0; i < count; i++) m = s[i] > m ? s[i] : m; }
-                    else { const uint32_t *s = src; for (uint32_t i = 0; i < count; i++) m = s[i] > m ? s[i] : m; }
-                    if (m > max_index) max_index = m;
-                } else
+                    // (no primitive restart - most draws: a plain maximum, which the compiler vectorizes; the scalar
+                    // loop with the restart test was ~9% of the render thread in the copy mode, every indexed draw)
+                    if (!st.prim_restart) {
+                        uint32_t m = 0;
+                        if (isz == 2) { const uint16_t *s = src; for (uint32_t i = 0; i < count; i++) m = s[i] > m ? s[i] : m; }
+                        else { const uint32_t *s = src; for (uint32_t i = 0; i < count; i++) m = s[i] > m ? s[i] : m; }
+                        if (m > max_index) max_index = m;
+                    } else
 #endif
-                if (isz == 2) { const uint16_t *s = src; for (uint32_t i = 0; i < count; i++) if (s[i] > max_index && s[i] != (uint16_t)restart) max_index = s[i]; }
-                else { const uint32_t *s = src; for (uint32_t i = 0; i < count; i++) if (s[i] > max_index && s[i] != restart) max_index = s[i]; }
+                    if (isz == 2) { const uint16_t *s = src; for (uint32_t i = 0; i < count; i++) if (s[i] > max_index && s[i] != (uint16_t)restart) max_index = s[i]; }
+                    else { const uint32_t *s = src; for (uint32_t i = 0; i < count; i++) if (s[i] > max_index && s[i] != restart) max_index = s[i]; }
+                    *im = (IbScanMemo){iaddr, chunk_epoch, gcopy_gen, count, isz, restart, max_index, ib};
+                }
             }
         } else if (native) {  // 8-bit indices: widen to 16
             ib = vk_transient((uint64_t)count * 2 + 4, 4);

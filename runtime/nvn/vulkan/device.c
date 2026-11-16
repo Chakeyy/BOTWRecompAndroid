@@ -1403,6 +1403,7 @@ static void vsync_update(uint64_t queued) {
         if (!p != !was || (p > was ? p - was : was - p) > was / 100) LOG("[pace] display vsync %.3f ms\n", p / 1e6);
         __atomic_store_n(&vs_period, p, __ATOMIC_RELAXED);
     }
+    if (present_id % 8 != 1 && vs_anchor && p) return;
     VkPastPresentationTimingGOOGLE past[8];
     uint32_t n = 8;
     if (vkGetPastPresentationTimingGOOGLE(g_vk.dev, g_vk.swapchain, &n, past) < 0) n = 0;  // (INCOMPLETE: the newest 8)
@@ -1592,6 +1593,7 @@ void backend_present(NvnTexture *t) {
     TexBackend *b = vk_tex(t, true);
     b->presented = true;
     vk_end_pass();
+    vk_flush_all_pending_clears();
     vk_flush_tex_clear(b);
 #ifdef __ANDROID__
     vk_bc_shadows_resolve(NULL, NULL, NULL, 0);  // (BC textures drawn into: decoded, as before anything outside a pass)
