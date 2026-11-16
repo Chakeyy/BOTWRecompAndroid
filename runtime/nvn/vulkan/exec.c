@@ -1506,20 +1506,31 @@ enum { DEDUPE_RSCALE_V, DEDUPE_RSCALE_F, DEDUPE_TINT, DEDUPE_DRV_V, DEDUPE_DRV_F
 // made each of their descriptor sets new too - the overworld's lit draws all have the same table, and Qualcomm's
 // driver is slow at writing descriptor sets (~4 ms a frame on them)
 static uint32_t gmap_tab[(GMAP_MAX + 1) * 4];
+static uint64_t gmap_ver = 1;
 static VkSpan gmap_copy(void) {
-    static struct { uint64_t epoch; uint32_t tab[(GMAP_MAX + 1) * 4]; VkSpan span; } c[8];
-    static int next;
+    static struct { uint64_t epoch, ver; uint32_t tab[(GMAP_MAX + 1) * 4]; VkSpan span; } c[8];
+    static int next, last_hit;
+    if (active >= 0 && c[last_hit].epoch == chunk_epoch && c[last_hit].ver == gmap_ver &&
+        c[last_hit].span.buf == chunks[active].buf) {
+        chunks[active].seq = vk_pending_seq();
+        chunks[active].frame = renderer_present_count();
+        return c[last_hit].span;
+    }
     for (int i = 0; i < 8; i++)
         if (active >= 0 && c[i].epoch == chunk_epoch && c[i].span.buf == chunks[active].buf &&
             !memcmp(c[i].tab, gmap_tab, sizeof c[i].tab)) {
+            c[i].ver = gmap_ver;
+            last_hit = i;
             chunks[active].seq = vk_pending_seq();
             chunks[active].frame = renderer_present_count();
             return c[i].span;
         }
     VkSpan sp = vk_transient_copy(gmap_tab, sizeof c[0].tab, 256);
     c[next].epoch = chunk_epoch;
+    c[next].ver = gmap_ver;
     memcpy(c[next].tab, gmap_tab, sizeof c[next].tab);
     c[next].span = sp;
+    last_hit = next;
     next = (next + 1) % 8;
     return sp;
 }
@@ -2721,11 +2732,12 @@ void vk_pend_clear_forget(TexBackend *b) {
     }
 }
 
+static uint32_t pend_clear_gen = 1;
 static void pend_clear_add(TexBackend *b) {
     if (!b) return;
     for (int i = 0; i < n_pend_clear; i++) if (pend_clear_list[i] == b) return;
     if (n_pend_clear == 32) vk_flush_tex_clear(pend_clear_list[0]);
-    if (n_pend_clear < 32) pend_clear_list[n_pend_clear++] = b;
+    if (n_pend_clear < 32) { pend_clear_list[n_pend_clear++] = b; pend_clear_gen++; }
 }
 
 void vk_flush_tex_clear(TexBackend *b) {
@@ -4425,15 +4437,17 @@ static TexBackend *feedback_snap[4];  // (the snapshot copy itself: array views 
 static uint64_t g_cur_fs_hash;
 static NvnTexture *snap_tex[8];
 static bool snap_ok[8];
+static uint8_t snap_ok_mask;
 static bool snap_fb_dirty[8];
 static const char *snap_why[8];
 static const char *snap_reason = "?";
 static void snapshots_invalidate(NvnTexture *t) {
+    if (!snap_ok_mask) return;
     uint64_t taddr = t ? t->addr : 0;
     for (int i = 0; i < 8; i++) {
         if (!snap_ok[i]) continue;
         bool match = !t || snap_tex[i] == t || (taddr && snap_tex[i] && snap_tex[i]->addr == taddr);
-        if (match) { snap_ok[i] = false; snap_fb_dirty[i] = false; snap_why[i] = snap_reason; }
+        if (match) { snap_ok[i] = false; snap_ok_mask &= (uint8_t)~(1u << i); snap_fb_dirty[i] = false; snap_why[i] = snap_reason; }
     }
 }
 static void snapshots_mark_fb_dirty(NvnTexture *t) {
@@ -4449,7 +4463,7 @@ static void snapshots_flush_fb_dirty(const char *why) {
         coalesce_mali_barrier = g_vk.props.vendorID == 0x13B5 && !getenv("LARECOMP_STRICT_FB_BARRIER");
     if (coalesce_mali_barrier && in_pass && !st.rt_dirty && why && why[0] == 'b') return;
     for (int i = 0; i < 8; i++)
-        if (snap_fb_dirty[i]) { snap_fb_dirty[i] = false; if (snap_ok[i]) { snap_ok[i] = false; snap_why[i] = why; } }
+        if (snap_fb_dirty[i]) { snap_fb_dirty[i] = false; if (snap_ok[i]) { snap_ok[i] = false; snap_ok_mask &= (uint8_t)~(1u << i); snap_why[i] = why; } }
 }
 
 typedef struct { NvnTexture *key; TexBackend copy; } Snap;
@@ -4803,19 +4817,19 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
     typedef struct {
         Prog *pr;
         uint64_t rt_ver, t0_ver, t1_ver, u0_ver, u1_ver, pool_ver, gcopy_ver, u0_data_ver, u1_data_ver, exec_seq, frame;
-        uint32_t sgen, vgen;
+        uint32_t sgen, vgen, pc_gen;
         bool clean;
     } RfMemo;
     static RfMemo rf_memo[128];
     bool bindless = pr->vi_bindless || pr->fi_bindless;
-    uint64_t cur_frame = !always && !g_debug_frame && !n_pend_clear ? vk_frame_counter() : 0;
+    uint64_t cur_frame = !always && !g_debug_frame ? vk_frame_counter() : 0;
     uint32_t rslot = (uint32_t)((((uintptr_t)pr * 0x9E3779B97F4A7C15ull) >> 32) ^
                                 (st_tex_ver[1] * 0xC2B2AE3Du) ^ (uint32_t)st_rt_ver) & 127u;
-    if (!always && !g_debug_frame && !n_pend_clear) {
+    if (!always && !g_debug_frame) {
         RfMemo *m = &rf_memo[rslot];
         if (m->clean && m->pr == pr && m->rt_ver == st_rt_ver && m->t0_ver == st_tex_ver[0] &&
             m->t1_ver == st_tex_ver[1] && m->pool_ver == st_pool_ver && m->gcopy_ver == g_gpu_copy_ver && m->sgen == tex_slot_gen &&
-            m->vgen == vk_view_gen && m->frame == cur_frame &&
+            m->vgen == vk_view_gen && m->pc_gen == pend_clear_gen && m->frame == cur_frame &&
             (!bindless || (m->u0_ver == st_ubuf_ver[0] && m->u1_ver == st_ubuf_ver[1] &&
                            m->u0_data_ver == st_stage_ubo_data_ver[0] &&
                            m->u1_data_ver == st_stage_ubo_data_ver[1] &&
@@ -4896,6 +4910,7 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
                             st.rt_dirty = true, stat_inplace_breaks++, prof_dirty[0]++;
                         if (si < 0) { static int rr; si = rr++ & 7; snap_tex[si] = t; }
                         snap_ok[si] = true;
+                        snap_ok_mask |= (uint8_t)(1u << si);
                         snap_fb_dirty[si] = false;
                     }
                     if (ninplace < 4) inplace_tex[ninplace++] = t;
@@ -4956,16 +4971,17 @@ static void resolve_feedback(Prog *pr, uint32_t draw_written) {
             feedback_view[nfeedback++] = vk_image_view(dst, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
             if (si < 0) { static int rr; si = rr++ & 7; snap_tex[si] = t; }
             snap_ok[si] = true;
+            snap_ok_mask |= (uint8_t)(1u << si);
             snap_fb_dirty[si] = false;
             st.rt_dirty = true;
         }
-    if (!any_attachment && !always && !g_debug_frame && !n_pend_clear) {
+    if (!any_attachment && !always && !g_debug_frame) {
         rf_memo[rslot] = (RfMemo){
             .pr = pr, .rt_ver = st_rt_ver, .t0_ver = st_tex_ver[0], .t1_ver = st_tex_ver[1],
             .u0_ver = st_ubuf_ver[0], .u1_ver = st_ubuf_ver[1], .pool_ver = st_pool_ver,
             .gcopy_ver = g_gpu_copy_ver, .u0_data_ver = st_stage_ubo_data_ver[0],
             .u1_data_ver = st_stage_ubo_data_ver[1], .exec_seq = g_exec_list_seq,
-            .frame = cur_frame, .sgen = tex_slot_gen, .vgen = vk_view_gen, .clean = true,
+            .frame = cur_frame, .sgen = tex_slot_gen, .vgen = vk_view_gen, .pc_gen = pend_clear_gen, .clean = true,
         };
     }
 }
@@ -5943,6 +5959,7 @@ static void gfast_prepare(VkCommandBuffer cb) {
     memset(gmap_tab, 0, sizeof gmap_tab);
     gfast_n = 0;
 #ifdef __ANDROID__
+    gmap_ver++;
     gfast_win = (VkDescriptorBufferInfo){0};
     if (!gcopy_mode) gc_size = 0;  // (a draw's gsnap_prepare copy: not this dispatch's)
 #endif
@@ -6570,7 +6587,10 @@ static bool gres_prepare(const GcRange *r, int m, bool store) {
     }
 #undef GRES_ADD
     tab[GMAP_MAX * 4] = (uint32_t)n;
-    memcpy(gmap_tab, tab, sizeof tab);
+    if (memcmp(gmap_tab, tab, sizeof tab) != 0) {
+        memcpy(gmap_tab, tab, sizeof tab);
+        gmap_ver++;
+    }
     gc_span = (VkSpan){.buf = ga_buf, .off = 0, .ptr = ga_ptr};
     gc_size = GA_SIZE;
     return true;
@@ -6611,6 +6631,7 @@ static void gres_reset(void) {
 // Accesses outside the table go to the heap from its start, as before.
 static void gwin_prepare(unsigned stage_mask) {
     memset(gmap_tab, 0, sizeof gmap_tab);
+    gmap_ver++;
     gfast_n = 0;
     gc_size = 0;
     gmem_info();
@@ -6660,6 +6681,7 @@ static void gwin_prepare(unsigned stage_mask) {
 // the game left the screen (2026-10-28). false: too much, or nothing bound (gwin_prepare then).
 static bool gsnap_prepare(void) {
     memset(gmap_tab, 0, sizeof gmap_tab);
+    gmap_ver++;
     gfast_n = 0;
     gc_size = 0;
     GcRange r[16];
@@ -6698,7 +6720,16 @@ static bool gsnap_prepare(void) {
 }
 
 static void gcopy_prepare(unsigned stage_mask, bool store) {
-    memset(gmap_tab, 0, sizeof gmap_tab);
+    static unsigned last_mask;
+    static uint64_t last_s0, last_s1, last_exec, last_gen, last_seq;
+    static int last_gl;
+    if (!store && (stage_mask & ~3u) == 0 && stage_mask == last_mask &&
+        (!(stage_mask & 1u) || st_sbuf_ver[0] == last_s0) &&
+        (!(stage_mask & 2u) || st_sbuf_ver[1] == last_s1) &&
+        g_exec_list_seq == last_exec && gcopy_gen == last_gen && gl_n == last_gl &&
+        vk_pending_seq() == last_seq && gc_size == GA_SIZE && gc_span.buf == ga_buf && gc_span.off == 0) {
+        return;
+    }
     gfast_n = 0;
     gc_size = 0;
     GcRange r[6 * 16];
@@ -6758,8 +6789,20 @@ static void gcopy_prepare(unsigned stage_mask, bool store) {
                 stage_mask, store ? "STORE" : "load", m, total / 1024.0, b, total > (64ull << 20) ? " (TOO MUCH: skipped)" : "");
         }
     }
-    if (m && gres_prepare(r, m, store)) return;  // (the arena: what shaders store stays on the GPU)
+    if (m && gres_prepare(r, m, store)) {
+        if (!store && (stage_mask & ~3u) == 0) {
+            last_mask = stage_mask;
+            last_s0 = st_sbuf_ver[0];
+            last_s1 = st_sbuf_ver[1];
+            last_exec = g_exec_list_seq;
+            last_gen = gcopy_gen;
+            last_gl = gl_n;
+            last_seq = vk_pending_seq();
+        }
+        return;  // (the arena: what shaders store stays on the GPU)
+    }
     memset(gmap_tab, 0, sizeof gmap_tab);
+    gmap_ver++;
     gc_size = 0;
     if (!m || total > (64ull << 20)) return;  // (too much: those loads read zero, as without this)
     gc_span = vk_transient(total, 256);
@@ -7312,7 +7355,7 @@ typedef struct {
     VkDescriptorSetLayout layout;
     VkDescriptorSet ds;
     VkBuffer gmem_buf;
-    uint64_t ubuf_ver, sbuf_ver, tex_ver, img_ver, pool_ver, ubo_data_ver, exec_seq, epoch, gcopy_gen, gpu_copy_ver, frame;
+    uint64_t ubuf_ver, sbuf_ver, tex_ver, img_ver, pool_ver, ubo_data_ver, exec_seq, epoch, gcopy_gen, gpu_copy_ver, frame, gmap_ver;
     uint64_t fii_stamp;
     uint32_t rgen, vgen, sgen, bank_epoch, ndyn, dyn[24];
     float rs0[4], tint[8], mirror_w;
@@ -7343,6 +7386,7 @@ static inline void fast_tab_insert(StageSetFast *way, ShaderInfo *si, VkDescript
         .pool_ver = st_pool_ver, .ubo_data_ver = st_stage_ubo_data_ver[stage],
         .exec_seq = g_exec_list_seq, .epoch = chunk_epoch,
         .gcopy_gen = gcopy_gen, .gpu_copy_ver = g_gpu_copy_ver, .frame = cur_frame,
+        .gmap_ver = si->uses_gmem_map ? gmap_ver : 0,
         .fii_stamp = fii_stamp,
         .rgen = rgen, .vgen = vgen, .sgen = sgen,
         .bank_epoch = bank_epoch, .ndyn = ndyn, .mirror_w = g_mirror_w,
@@ -7358,7 +7402,7 @@ typedef struct {
     VkDescriptorSetLayout layout;
     VkDescriptorSet ds;
     VkBuffer gmem_buf;
-    uint64_t exec_seq, epoch, gcopy_gen, gpu_copy_ver, frame, ubo_data_ver, pool_ver, sbuf_ver, img_ver, tex_ver, fii_stamp, k1_addr;
+    uint64_t exec_seq, epoch, gcopy_gen, gpu_copy_ver, frame, ubo_data_ver, pool_ver, sbuf_ver, img_ver, tex_ver, fii_stamp, k1_addr, gmap_ver;
     uint32_t rgen, vgen, sgen, bank_epoch, cbuf_mask;
     float mir_w;
     uint8_t set, ndyn, ncb;
@@ -7392,6 +7436,7 @@ static inline void fast2_tab_insert(StageFast2 *way, ShaderInfo *si, VkDescripto
         .gpu_copy_ver = g_gpu_copy_ver, .frame = cur_frame, .ubo_data_ver = st_stage_ubo_data_ver[stage],
         .pool_ver = st_pool_ver, .sbuf_ver = st_sbuf_ver[stage], .img_ver = st_img_ver[stage],
         .tex_ver = st_tex_ver[0], .fii_stamp = fii_stamp, .k1_addr = k1_addr,
+        .gmap_ver = si->uses_gmem_map ? gmap_ver : 0,
         .rgen = rgen, .vgen = vgen, .sgen = sgen, .bank_epoch = bank_epoch,
         .cbuf_mask = umask, .mir_w = g_mirror_w, .set = (uint8_t)set, .ndyn = (uint8_t)ndyn,
         .ncb = (uint8_t)ncb, .bank = bank,
@@ -7428,7 +7473,9 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         if (tint) memcpy(tint_cur, tint, 32);
     }
     uint64_t fii_stamp_cur = (stage == 1 && si->ntex) ? fii_memo_active_id : 0;
-    bool can_fast = !fast_off && !set_cache_off && stage < 2 && !bindless && !si->uses_gmem_map &&
+    uint64_t cur_gmap_ver = si->uses_gmem_map ? gmap_ver : 0;
+    bool gmem_fast_ok = !si->uses_gmem_map || (gcopy_mode && gc_size == GA_SIZE && gc_span.buf == ga_buf && gc_span.off == 0);
+    bool can_fast = !fast_off && !set_cache_off && stage < 2 && !bindless && gmem_fast_ok &&
                     !up_fix.sx &&
                     (si->ntex == 0 || (!nfeedback && !n_pass_fb && !scene_up.t)) &&
                     (stage == 0 || !si->ntex || (pre_ii && fii_stamp_cur));
@@ -7449,12 +7496,17 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                 f->pool_ver == st_pool_ver && f->ubo_data_ver == st_stage_ubo_data_ver[stage] &&
                 f->exec_seq == g_exec_list_seq && f->epoch == chunk_epoch &&
                 f->gcopy_gen == gcopy_gen && f->frame == cur_frame && f->gmem_buf == gmem_buf &&
+                f->gmap_ver == cur_gmap_ver &&
                 (!si->uses_rscale || f->mirror_w == g_mirror_w) &&
                 (stage == 0 ? (!si->ntex || f->gpu_copy_ver == g_gpu_copy_ver)
                             : ((!si->ntex || f->fii_stamp == fii_stamp_cur) &&
                                (!si->uses_rscale || !memcmp(f->rs0, rs0_cur, sizeof rs0_cur)) &&
                                (!si->uses_tint || !memcmp(f->tint, tint_cur, sizeof tint_cur))))) {
                 desc_banks[(int)f->bank].last_seq = pending;
+                if (si->uses_gmem_map && active >= 0) {
+                    chunks[active].seq = pending;
+                    chunks[active].frame = cur_frame;
+                }
                 if (dyn && f->ndyn) memcpy(dyn, f->dyn, f->ndyn * sizeof f->dyn[0]);
                 if (ndyn) *ndyn = f->ndyn;
                 if (i == 1) {
@@ -7494,6 +7546,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                     e->pool_ver == st_pool_ver && e->ubo_data_ver == st_stage_ubo_data_ver[stage] &&
                     e->exec_seq == g_exec_list_seq && e->epoch == chunk_epoch &&
                     e->gcopy_gen == gcopy_gen && e->frame == cur_frame && e->gmem_buf == gmem_buf &&
+                    e->gmap_ver == cur_gmap_ver &&
                     e->cbuf_mask == umask && e->ncb == (uint8_t)ncb && e->k1_addr == k1_addr &&
                     (!si->uses_rscale || e->mir_w == g_mirror_w) &&
                     (stage == 0 ? (!si->ntex || (e->tex_ver == st_tex_ver[0] && e->gpu_copy_ver == g_gpu_copy_ver))
@@ -7506,6 +7559,10 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
                     }
                     if (!cb_ok) continue;
                     desc_banks[(int)e->bank].last_seq = pending;
+                    if (si->uses_gmem_map && active >= 0) {
+                        chunks[active].seq = pending;
+                        chunks[active].frame = cur_frame;
+                    }
                     if (dyn && e->ndyn) memcpy(dyn, e->dyn, e->ndyn * sizeof e->dyn[0]);
                     if (ndyn) *ndyn = e->ndyn;
                     if (i == 1) {
@@ -8143,14 +8200,20 @@ int vk_recent_fs_shaders(uint64_t *hashes, uint32_t *hits, uint16_t *w, uint16_t
     return n;
 }
 // Grass in BOTW's overworld: instanced draws into the G-buffer (3+ color targets with depth) that sample the
-// R16G16B16A16_UNORM terrain/wind placement texture in the vertex shader (see textures.c vk_format_filters_linear:
-// "BOTW's grass reads one in its vertex shader").
-static bool draw_is_grass(Prog *pr, CmdRec *r, bool indexed) {
-    if (!g_settings.skip_grass || !pr || !pr->vi || pr->vi->ntex == 0) return false;
-    if (!st.rt.depth || st.rt.ncolor < 2) return false;
+// R16G16B16A16_UNORM (fmt 0x2A, <= 256x256) terrain/wind placement texture in the vertex shader (see textures.c
+// vk_format_filters_linear: "BOTW's grass reads one in its vertex shader"), plus the 160x160 fmt 0x2A placement pass.
+static bool draw_is_grass(Prog *pr, CmdRec *r, bool indexed, uint64_t fs_hash) {
+    if (!g_settings.skip_grass) return false;
+    if (fs_hash == 0xa9128e7fa7bb3711ull) return true;
+    if (!pr || !pr->vi || pr->vi->ntex == 0) return false;
+    if (!st.rt.depth || st.rt.ncolor < 3) return false;
     uint32_t inst = (uint32_t)(indexed ? r->x[6] : r->x[4]);
     if (inst <= 1) return false;
-    return true;
+    for (int i = 0; i < pr->vi->ntex; i++) {
+        NvnTexture *vt = shader_texture_object(0, &pr->vi->tex[i]);
+        if (vt && vt->format == 0x2A && vt->width <= 256 && vt->height <= 256) return true;
+    }
+    return false;
 }
 // Skip the game's own internal dynamic resolution scale target refresh when our lower dyn_min floor is active.
 static __attribute__((unused)) bool skip_dyn_refresh(void) {
@@ -8164,12 +8227,12 @@ static bool sg_skip(uint64_t h) {
     if (g_settings.skip_named && SG_HAS(SG_NAMED, h)) return true;
     return false;
 }
-// Runtime state heuristics for Particles and Environmental effects:
-// In BOTW, particles and weather/fog sheets are drawn into the 3D scene (with depth bound for soft-depth testing)
-// into 1-2 color targets (never the 3+ target G-buffer, and never HUD/post-process passes which have no depth),
-// with depth write off (st.ds[0] && !st.ds[1]) and color blending enabled (st.color_state[0] & 1).
+// Runtime state heuristics for Particles:
+// Match only instanced billboard/quad particle draws (inst >= 4, 4..36 vertices per instance) into 1-2 color targets
+// with depth test on, depth write off, and blending enabled. Never match single-instance (inst == 1) draws, which are
+// used by BOTW's deferred lighting accumulation and point/spot light volume passes.
 static bool fx_heuristic(CmdRec *r, bool indexed) {
-    if (g_settings.particles == 0 && !g_settings.no_ambient) return false;
+    if (g_settings.particles == 0) return false;
     if (!st.rt.depth || st.rt.ncolor < 1 || st.rt.ncolor > 2) return false;
     NvnTexture *ct = st.rt.color[0];
     if (!ct || ct->width < 160 || ct->height < 90) return false;
@@ -8179,17 +8242,9 @@ static bool fx_heuristic(CmdRec *r, bool indexed) {
     if (!depth_test || depth_write || !blend_on) return false;
     uint32_t count = (uint32_t)r->x[2];
     uint32_t inst = (uint32_t)(indexed ? r->x[6] : r->x[4]);
-    if (inst == 0) inst = 1;
-    uint8_t dst_c = st.blend[0][2];
-    bool additive = (dst_c == 2);
-    if (g_settings.particles == 2) {
-        if (inst > 1 || additive || count >= 6) return true;
-    } else if (g_settings.particles == 1) {
-        if (inst >= 4 || (additive && count >= 12) || count >= 48) return true;
-    }
-    if (g_settings.no_ambient) {
-        if (additive || (inst == 1 && count >= 3 && count <= 6)) return true;
-    }
+    if (inst < 4 || count < 4 || count > 36) return false;
+    if (g_settings.particles == 2) return true;
+    if (g_settings.particles == 1 && inst >= 8) return true;
     return false;
 }
 // True if the current render target setup is a depth-only shadow pass (either ncolor == 0, or all color slots are NULL
@@ -8219,6 +8274,9 @@ static void draw(CmdRec *r, bool indexed) {
 static uint64_t prof_tp_;
 static void draw_(CmdRec *r, bool indexed) {
     if (prof) prof_tp_ = SDL_GetTicksNS();
+#ifdef __ANDROID__
+    if (g_settings.skip_shadows && st.rt.ncolor == 0 && st.rt.depth) { stat_skipped++; return; }
+#endif
     if (!st.program) { stat_skipped++; return; }
     ShaderKey vkey = {0}, fkey = {0};
     vkey.glsl = fkey.glsl = 1;
@@ -8305,13 +8363,11 @@ static void draw_(CmdRec *r, bool indexed) {
         }
         for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { stat_skipped++; return; }
 #ifdef __ANDROID__
-        fs_hist_note(last_hash);
-        if (g_settings.skip_shadows && (rt_is_shadow_pass() || last_hash == 0x3b4a13d3f35852f8ull ||
-                                        last_hash == 0x9f7e15ce0e7329b9ull || last_hash == 0x713a8d1b2e7da299ull)) {
+        if (g_settings.skip_shadows && (rt_is_shadow_pass() || last_hash == 0x3b4a13d3f35852f8ull)) {
             stat_skipped++;
             return;
         }
-        if (draw_is_grass(pr, r, indexed)) { stat_skipped++; return; }
+        if (draw_is_grass(pr, r, indexed, last_hash)) { stat_skipped++; return; }
         if (sg_skip(last_hash)) { stat_skipped++; return; }
         if (fx_heuristic(r, indexed)) { stat_skipped++; return; }
         if (g_settings.skip_fs[0]) {
@@ -8334,6 +8390,7 @@ static void draw_(CmdRec *r, bool indexed) {
             for (int i = 0; i < n_live; i++)
                 if (last_hash == live_skip[i]) { stat_skipped++; return; }
         }
+        if (g_settings.show_fps) fs_hist_note(last_hash);
 #endif
         {   // LARECOMP_SKIPVS=1 (diagnosis): build/skipvs.txt lists vertex shader code addresses ("3da039b00,3da258600";
             // empty: none) whose draws are skipped - re-read twice a second, so a draw can be found by toggling it while
@@ -8593,23 +8650,27 @@ static void draw_(CmdRec *r, bool indexed) {
     const uint32_t draw_w = draw_writes(pr);
     resolve_feedback(pr, draw_w);
     scene_upscale(pr, r);
-    snap_reason = "draw-depthwrite";
-    if (st.rt.depth && st.ds[0] && st.ds[1]) {
-        bool fb = false;
-        for (int k = 0; k < nfeedback; k++) fb |= feedback_tex[k] == st.rt.depth;
-        for (int k = 0; k < ninplace; k++) fb |= inplace_tex[k] == st.rt.depth;
-        if (fb) snapshots_mark_fb_dirty(st.rt.depth);
-        else snapshots_invalidate(st.rt.depth);
+    if (snap_ok_mask) {
+        snap_reason = "draw-depthwrite";
+        if (st.rt.depth && st.ds[0] && st.ds[1]) {
+            bool fb = false;
+            for (int k = 0; k < nfeedback; k++) fb |= feedback_tex[k] == st.rt.depth;
+            for (int k = 0; k < ninplace; k++) fb |= inplace_tex[k] == st.rt.depth;
+            if (fb) snapshots_mark_fb_dirty(st.rt.depth);
+            else snapshots_invalidate(st.rt.depth);
+        }
     }
     if (in_pass && (draw_w & pass_dup_null)) st.rt_dirty = true, prof_dirty[2]++;  // (writes a slot begin_pass left unbound)
-    snap_reason = "draw-colorwrite";
-    for (int i = 0; i < st.rt.ncolor; i++) {
-        if ((draw_w >> i) & 1) {
-            bool fb = false;
-            for (int k = 0; k < nfeedback; k++) fb |= feedback_tex[k] == st.rt.color[i];
-            for (int k = 0; k < ninplace; k++) fb |= inplace_tex[k] == st.rt.color[i];
-            if (fb) snapshots_mark_fb_dirty(st.rt.color[i]);
-            else snapshots_invalidate(st.rt.color[i]);
+    if (snap_ok_mask) {
+        snap_reason = "draw-colorwrite";
+        for (int i = 0; i < st.rt.ncolor; i++) {
+            if ((draw_w >> i) & 1) {
+                bool fb = false;
+                for (int k = 0; k < nfeedback; k++) fb |= feedback_tex[k] == st.rt.color[i];
+                for (int k = 0; k < ninplace; k++) fb |= inplace_tex[k] == st.rt.color[i];
+                if (fb) snapshots_mark_fb_dirty(st.rt.color[i]);
+                else snapshots_invalidate(st.rt.color[i]);
+            }
         }
     }
     if (vk_narrow_pass_barrier_on() && g_gpu_write_serial > g_vertex_synced_serial) {
@@ -8957,7 +9018,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if ((gcopy_mode || gwin_mode) && (pr->vi->uses_gmem_map || pr->fi->uses_gmem_map)) {  // (the table both stages' sets use)
             static int snap = -1;  // (LARECOMP_NO_GSNAP=1: through gcopy/gwin as before)
             if (snap < 0) snap = getenv("LARECOMP_NO_GSNAP") == NULL;
-            bool snapped = snap && pr->vi->uses_gmem_map && !pr->fi->uses_gmem_map && !pr->vi->uses_gmem_store && gsnap_prepare();
+            bool snapped = gwin_mode && snap && pr->vi->uses_gmem_map && !pr->fi->uses_gmem_map && !pr->vi->uses_gmem_store && gsnap_prepare();
             if (!snapped) {
                 uint32_t mask = (pr->vi->uses_gmem_map ? 1u : 0u) | (pr->fi->uses_gmem_map ? 2u : 0u);
                 if (gcopy_mode)
@@ -10421,11 +10482,6 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         }
         case CMD_CLEAR_DEPTH_STENCIL:
-#ifdef __ANDROID__
-            if (g_settings.skip_shadows && rt_is_shadow_pass() && st.rt.depth->width >= 256 &&
-                st.rt.depth->width == st.rt.depth->height)
-                break;
-#endif
             if (st.rt.depth) { snap_reason = "clear-depth"; snapshots_invalidate(st.rt.depth); }
             if (ct_on() && st.rt.depth)
                 LOG("[ct] clear-depth %p d%d s%d sc %d %d %d %d\n", (void *)st.rt.depth, r->x[0] != 0, r->x[2] != 0, st.scissor[0][0],

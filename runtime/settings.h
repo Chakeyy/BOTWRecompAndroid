@@ -83,6 +83,7 @@ typedef struct {
     int dyn_min;          // Dynamic resolution floor %: 50 (default), 35, 25, 60, 75
     int dyn_target;       // Dynamic resolution target fps: 0 Auto (follows Frame rate), 30, 45, 60
     bool perf_r16_init;   // One-time Mali-G57 / Helio G99 performance preset migration marker
+    bool perf_r17_init;   // One-time r17 lighting fix & open-world culling preset migration marker
     bool log_file;        // the log in a file as well (platform/android.c), to send with a report
     bool vk_prof;         // [vkprof] CPU/GPU per-stage counters every 2 s (vulkan/exec.c); LARECOMP_VK_PROF overrides
     char gpu_model[64];   // the GPU of the last start ("Adreno (TM) 830v1"): turnip_lrz's Automatic, before the driver

@@ -1929,12 +1929,7 @@ static VkSampler make_sampler(const NvnSamplerDesc *d, bool compare) {
     if (stest && mf > 1) { si.minLod = 0; si.maxLod = VK_LOD_CLAMP_NONE; si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = 16; }
     if (d->compare_mode && compare) {
         si.compareEnable = VK_TRUE;
-#ifdef __ANDROID__
-        bool no_sh = g_settings.skip_shadows || getenv("LARECOMP_NO_SHADOW");
-#else
-        bool no_sh = getenv("LARECOMP_NO_SHADOW") != NULL;
-#endif
-        si.compareOp = no_sh ? VK_COMPARE_OP_ALWAYS : compare_op(d->compare_func);
+        si.compareOp = getenv("LARECOMP_NO_SHADOW") ? VK_COMPARE_OP_ALWAYS : compare_op(d->compare_func);
     }
     VkSamplerCustomBorderColorCreateInfoEXT cb = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
     if (border) {

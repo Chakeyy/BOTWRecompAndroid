@@ -61,15 +61,17 @@ Settings g_settings = {
     .turnip_lrz = -1,
     .low_ram = 1,
     .skip_shadows = true,
+    .skip_grass = true,
     .particles = 1,
-    .no_ambient = true,
+    .no_ambient = false,
     .geo_detail = 1,
     .tex_quality = 1,
     .aniso_cap = 1,
     .shader_workers = 2,
     .compile_prio = -1,
     .vc_aggressive = true,
-    .dyn_min = 50,
+    .render_dist = 2,
+    .dyn_min = 35,
     .dyn_target = 30,
     .event_fps_unlock = false,  // (some events count frames: hle/framepace.c in_event)
     .fps_mode = 1,  // (30: the game's own choice dropped the overworld to 20, where the GPU's clocks settled low)
@@ -346,6 +348,7 @@ void settings_load(void) {
         else if (!strcmp(key, "dyn_min")) g_settings.dyn_min = atoi(val);
         else if (!strcmp(key, "dyn_target")) g_settings.dyn_target = atoi(val);
         else if (!strcmp(key, "perf_r16_init")) g_settings.perf_r16_init = atoi(val) != 0;
+        else if (!strcmp(key, "perf_r17_init")) g_settings.perf_r17_init = atoi(val) != 0;
         else if (!strcmp(key, "log_file")) g_settings.log_file = atoi(val) != 0;
         else if (!strcmp(key, "vk_prof")) g_settings.vk_prof = atoi(val) != 0;
         else if (!strcmp(key, "gpu_model")) snprintf(g_settings.gpu_model, sizeof g_settings.gpu_model, "%s", val);
@@ -433,7 +436,7 @@ void settings_load(void) {
         g_settings.low_ram = 1;
         g_settings.skip_shadows = true;
         g_settings.particles = 1;
-        g_settings.no_ambient = true;
+        g_settings.no_ambient = false;
         g_settings.geo_detail = 1;
         g_settings.tex_quality = 1;
         g_settings.aniso_cap = 1;
@@ -441,7 +444,19 @@ void settings_load(void) {
         g_settings.compile_prio = -1;
         g_settings.vc_aggressive = true;
         g_settings.res_mode = RES_DYNAMIC;
-        g_settings.dyn_min = 50;
+        g_settings.dyn_min = 35;
+        g_settings.dyn_target = 30;
+    }
+    if (!g_settings.perf_r17_init) {
+        g_settings.perf_r17_init = true;
+        g_settings.no_ambient = false;
+        g_settings.skip_shadows = true;
+        g_settings.skip_grass = true;
+        g_settings.particles = 1;
+        g_settings.geo_detail = 1;
+        g_settings.render_dist = 2;
+        g_settings.res_mode = RES_DYNAMIC;
+        g_settings.dyn_min = 35;
         g_settings.dyn_target = 30;
         settings_save();
     }
@@ -478,13 +493,13 @@ void settings_save(void) {
             g_settings.sync_lag, g_settings.native_code, g_settings.files_in_place);
     static const char *const tri[] = {"auto", "0", "1"};  // (-1 / 0 / 1)
 #define TRI(v) tri[(v) < 0 ? 0 : (v) ? 2 : 1]
-    fprintf(f, "gpu_heap = %s\ninplace_reads = %s\nturnip_lrz = %s\nlow_ram = %s\nskip_shadows = %d\nskip_fs = %s\nskip_grass = %d\ntex_quality = %d\naniso_cap = %d\nparticles = %d\nno_ambient = %d\nskip_named = %d\nvc_budget_mb = %d\nframepace_off = %d\nshader_workers = %d\ncompile_prio = %d\ngeo_detail = %d\ntex_cap = %d\nvc_aggressive = %d\nrender_dist = %d\nfps_limit = %d\npace_mode = %d\ndyn_min = %d\ndyn_target = %d\nperf_r16_init = %d\nlog_file = %d\nvk_prof = %d\ngpu_model = %s\n",
+    fprintf(f, "gpu_heap = %s\ninplace_reads = %s\nturnip_lrz = %s\nlow_ram = %s\nskip_shadows = %d\nskip_fs = %s\nskip_grass = %d\ntex_quality = %d\naniso_cap = %d\nparticles = %d\nno_ambient = %d\nskip_named = %d\nvc_budget_mb = %d\nframepace_off = %d\nshader_workers = %d\ncompile_prio = %d\ngeo_detail = %d\ntex_cap = %d\nvc_aggressive = %d\nrender_dist = %d\nfps_limit = %d\npace_mode = %d\ndyn_min = %d\ndyn_target = %d\nperf_r16_init = %d\nperf_r17_init = %d\nlog_file = %d\nvk_prof = %d\ngpu_model = %s\n",
             TRI(g_settings.gpu_heap), TRI(g_settings.inplace_reads), TRI(g_settings.turnip_lrz), TRI(g_settings.low_ram),
             g_settings.skip_shadows, g_settings.skip_fs, g_settings.skip_grass, g_settings.tex_quality, g_settings.aniso_cap,
             g_settings.particles, g_settings.no_ambient, g_settings.skip_named, g_settings.vc_budget_mb, g_settings.framepace_off,
             g_settings.shader_workers, g_settings.compile_prio, g_settings.geo_detail, g_settings.tex_cap, g_settings.vc_aggressive,
             g_settings.render_dist, g_settings.fps_limit, g_settings.pace_mode, g_settings.dyn_min, g_settings.dyn_target,
-            g_settings.perf_r16_init ? 1 : 0, g_settings.log_file, g_settings.vk_prof, g_settings.gpu_model);
+            g_settings.perf_r16_init ? 1 : 0, g_settings.perf_r17_init ? 1 : 0, g_settings.log_file, g_settings.vk_prof, g_settings.gpu_model);
     fprintf(f, "driver_env = %s\nheap_file = %d\n", g_settings.driver_env, g_settings.heap_file);
 #undef TRI
     fprintf(f, "touch_drag_camera = %d\ntouch_drag_sens = %.2f\ntouch_sticks_hidden = %d\ntouch_half_areas = %d\n",

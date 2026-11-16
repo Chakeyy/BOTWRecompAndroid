@@ -75,14 +75,28 @@ static bool is_16_9(float a) { return a > 1.7767f && a < 1.7789f; }
 RT_ON_RESET(widescreen_reset) { g_boot_aspect = -1, g_hooked = false, g_widened = false; }  // (Return to start: a new boot)
 #ifdef __ANDROID__
 static void persp_far_limit(uint64_t proj) {
-    if (!proj || !g_settings.render_dist) return;
+    if (!proj) return;
     float *far_p = (float *)(uintptr_t)(proj + 0x9c);
     float f = *far_p;
-    if (f >= 500.0f && f <= 60000.0f) {
-        static const float scale[] = {1.0f, 0.75f, 0.50f, 0.30f};
-        int m = g_settings.render_dist;
-        if (m >= 1 && m <= 3) *far_p = f * scale[m];
+    if (!(f >= 500.0f && f <= 100000.0f)) return;
+    static struct { uint64_t proj; float orig, scaled; } tab[64];
+    uint32_t slot = (uint32_t)((proj >> 4) * 0x9E3779B9u) & 63u;
+    float orig = f;
+    if (tab[slot].proj == proj && (f - tab[slot].scaled < 1.0f && tab[slot].scaled - f < 1.0f)) {
+        orig = tab[slot].orig;
     }
+    int m = g_settings.render_dist;
+    float out = orig;
+    if (m >= 1 && m <= 3) {
+        static const float scale_far[] = {1.0f, 0.35f, 0.18f, 0.10f};
+        static const float scale_mid[] = {1.0f, 0.75f, 0.50f, 0.30f};
+        out = orig * (orig > 5000.0f ? scale_far[m] : scale_mid[m]);
+        if (out < 450.0f) out = 450.0f;
+    }
+    tab[slot].proj = proj;
+    tab[slot].orig = orig;
+    tab[slot].scaled = out;
+    *far_p = out;
 }
 #endif
 void rt_persp_update(uint64_t proj) {
